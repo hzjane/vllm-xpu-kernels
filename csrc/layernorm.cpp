@@ -736,7 +736,7 @@ void rms_norm(
       input.dim() >= 2 && input.dim() <= 4 && input.size(0) >= 1 &&
       input.size(0) <= 8 && input.stride(-1) == 1 && epsilon >= 0 &&
       (input.size(-1) == 256 || input.size(-1) == 512 ||
-       input.size(-1) == 2816) &&
+       input.size(-1) == 2816 || input.size(-1) == 5376) &&
       input.numel() / input.size(-1) >= 1 &&
       input.numel() / input.size(-1) <= 128 &&
       weight.device() == input.device() && weight.scalar_type() == at::kHalf &&

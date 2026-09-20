@@ -28,7 +28,8 @@ struct SmallMRms {
 
   void operator()
       [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<3> item) const {
-    constexpr int Threads = Width / 8;
+    constexpr int Packs = Width == 5376 ? 3 : 1;
+    constexpr int Threads = Width / (8 * Packs);
     const int lane = item.get_local_id(2);
     const int64_t row =
         (item.get_group(0) * rows.size[1] + item.get_group(1)) * rows.size[2] +
@@ -36,19 +37,23 @@ struct SmallMRms {
     const int64_t input_offset = item.get_group(0) * rows.stride[0] +
                                  item.get_group(1) * rows.stride[1] +
                                  item.get_group(2) * rows.stride[2];
-    Half8 values;
-    if constexpr (Aligned) {
-      values = reinterpret_cast<const Half8*>(input + input_offset)[lane];
-    } else {
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        values.values[i] = input[input_offset + lane * 8 + i];
-    }
+    Half8 values[Packs];
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const float value = float(values.values[i]);
-      sum += value * value;
+    for (int p = 0; p < Packs; ++p) {
+      const int chunk = lane + p * Threads;
+      if constexpr (Aligned) {
+        values[p] = reinterpret_cast<const Half8*>(input + input_offset)[chunk];
+      } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          values[p].values[i] = input[input_offset + chunk * 8 + i];
+      }
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float value = float(values[p].values[i]);
+        sum += value * value;
+      }
     }
     if constexpr (Threads == 32) {
       sum = sycl::reduce_over_group(
@@ -57,29 +62,32 @@ struct SmallMRms {
       sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<float>());
     }
     const float inverse_rms = sycl::rsqrt(sum / Width + epsilon);
-    Half8 weights;
-    if constexpr (Weighted && Aligned) {
-      weights = reinterpret_cast<const Half8*>(weight)[lane];
-    }
-    Half8 result;
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      const int column = lane * 8 + i;
-      // Match upstream weighted RMS: round normalization before weighting.
-      sycl::half value = sycl::half(float(values.values[i]) * inverse_rms);
-      if constexpr (Weighted) {
-        const float w =
-            Aligned ? float(weights.values[i]) : float(weight[column]);
-        value = sycl::half(float(value) * w);
+    for (int p = 0; p < Packs; ++p) {
+      const int chunk = lane + p * Threads;
+      Half8 weights;
+      if constexpr (Weighted && Aligned)
+        weights = reinterpret_cast<const Half8*>(weight)[chunk];
+      Half8 result;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int column = chunk * 8 + i;
+        // Preserve the existing FP16 normalization/weighting boundary.
+        sycl::half value = sycl::half(float(values[p].values[i]) * inverse_rms);
+        if constexpr (Weighted) {
+          const float w =
+              Aligned ? float(weights.values[i]) : float(weight[column]);
+          value = sycl::half(float(value) * w);
+        }
+        result.values[i] = value;
       }
-      result.values[i] = value;
-    }
-    if constexpr (Aligned) {
-      reinterpret_cast<Half8*>(output + row * Width)[lane] = result;
-    } else {
+      if constexpr (Aligned)
+        reinterpret_cast<Half8*>(output + row * Width)[chunk] = result;
+      else {
 #pragma unroll
-      for (int i = 0; i < 8; ++i)
-        output[row * Width + lane * 8 + i] = result.values[i];
+        for (int i = 0; i < 8; ++i)
+          output[row * Width + chunk * 8 + i] = result.values[i];
+      }
     }
   }
 };
@@ -97,8 +105,8 @@ void check(
       "Expected rank 2..4, M=1..8 and unit final stride");
   const auto width = input.size(-1);
   TORCH_CHECK(
-      width == 256 || width == 512 || width == 2816,
-      "Expected hidden size 256, 512 or 2816");
+      width == 256 || width == 512 || width == 2816 || width == 5376,
+      "Expected hidden size 256, 512, 2816 or 5376");
   TORCH_CHECK(
       input.numel() / width >= 1 && input.numel() / width <= 128,
       "Expected 1..128 normalized rows");
@@ -120,7 +128,7 @@ void launch(
     const std::optional<at::Tensor>& weight,
     float epsilon,
     Rows rows) {
-  constexpr int Threads = Width / 8;
+  constexpr int Threads = Width / (8 * (Width == 5376 ? 3 : 1));
   auto& queue = c10::xpu::getCurrentXPUStream(input.get_device()).queue();
   queue.parallel_for(
       sycl::nd_range<3>(
@@ -171,6 +179,7 @@ void dispatch(
     LAUNCH_WIDTH(256);
     LAUNCH_WIDTH(512);
     LAUNCH_WIDTH(2816);
+    LAUNCH_WIDTH(5376);
   }
 #undef LAUNCH_WIDTH
 #undef LAUNCH_CASE

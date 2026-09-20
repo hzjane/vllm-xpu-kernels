@@ -371,7 +371,8 @@ at::Tensor rms_dispatch(
     const at::Tensor& x, const std::optional<at::Tensor>& weight, double eps) {
   if (x.is_xpu() && x.scalar_type() == at::kHalf && x.dim() >= 2 &&
       x.dim() <= 4 && x.size(0) >= 1 && x.size(0) <= 8 &&
-      (x.size(-1) == 256 || x.size(-1) == 512 || x.size(-1) == 2816) &&
+      (x.size(-1) == 256 || x.size(-1) == 512 || x.size(-1) == 2816 ||
+       x.size(-1) == 5376) &&
       x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 128 &&
       x.stride(-1) == 1 && eps >= 0 &&
       (!weight || (weight->device() == x.device() &&
