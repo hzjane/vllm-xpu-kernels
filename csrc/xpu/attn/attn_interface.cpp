@@ -4,6 +4,7 @@
 #ifdef VLLM_XPU_ENABLE_XE2
   #include "csrc/xpu/attn/xe_2/fmha_xe2.h"
   #include "csrc/xpu/attn/xe_2/paged_decode_xe2.h"
+  #include "csrc/xpu/attn/xe_2/paged_decode_small_m.h"
 #endif
 #ifdef VLLM_XPU_ENABLE_XE3P
   #include "csrc/xpu/attn/xe_3/fmha_xe3.h"
@@ -134,6 +135,27 @@ void cutlass_paged_decode_interface(
     std::optional<at::Tensor>& softmax_lse) {
   if (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch()) {
 #ifdef VLLM_XPU_ENABLE_XE2
+    if (vllm::xpu::is_xe2_arch() && is_varlen && is_paged && !is_causal &&
+        !is_local && !is_sink && !is_prefill.has_value() &&
+        !splits_per_seq.has_value() && !work_list.has_value() &&
+        try_paged_decode_small_m_xe2(
+            queue,
+            query,
+            key_cache,
+            value_cache,
+            out,
+            temp_out,
+            exp_sums,
+            max_logits,
+            block_table,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            num_kv_splits,
+            sm_scale)) {
+      return;
+    }
     // Use XE2 cutlass kernel (also used as WA for XE3/XE3P)
     vllm::xpu::xe2::cutlass_paged_decode_xe2(
         queue,
