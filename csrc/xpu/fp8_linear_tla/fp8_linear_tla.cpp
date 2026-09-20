@@ -218,6 +218,136 @@ at::Tensor fp8_gemm_fused_impl(
   return output;
 }
 
+// Keep the original fused launcher above intact: SLM requires accessor-based
+// submission, while the existing shapes retain their no-accessor fast path.
+template <int N, int Splits>
+class NtSlmSplitKGemm;
+template <int kTileNFused, int kSplits>
+at::Tensor fp8_gemm_slm_impl(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& scale,
+    const std::optional<at::Tensor>& bias) {
+  constexpr bool UseSlm = true;
+  constexpr int kTileN = kTileNFused;
+  using Tile = Shape<_8, Int<kTileN>, _32>;
+  using LayoutSG =
+      Layout<Shape<_1, Int<kTileN / 16>, _1>, Stride<Int<kTileN / 16>, _1, _0>>;
+  using MMA = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, ElementA>>,
+      Layout<Tile>,
+      LayoutSG>::TiledMMA;
+  TORCH_CHECK(
+      input.is_xpu() && input.scalar_type() == at::kHalf && input.dim() == 2 &&
+          input.is_contiguous(),
+      "linear_tla_unsupported: contiguous FP16 XPU A[M,K] required");
+  const int64_t m = input.size(0);
+  const int64_t k = input.size(1);
+  TORCH_CHECK(
+      weight.device() == input.device() && weight.dim() == 2 &&
+          weight.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+          weight.size(0) == k && weight.stride(0) == 1 && weight.stride(1) == k,
+      "linear_tla_unsupported: FP8 B[K,N] stride(1,K) required");
+  const int64_t n = weight.size(1);
+  TORCH_CHECK(
+      m >= 1 && m <= 8 && k >= kSplits * kTileK && k <= 65536 &&
+          k % kTileK == 0 && n >= kTileN && n <= 65536 && n % kTileN == 0,
+      "linear_tla_unsupported: M1..8, K%32=0/K>=256, N%64=0 required");
+  TORCH_CHECK(
+      !bias.has_value() && scale.has_value() &&
+          scale->device() == input.device() &&
+          scale->scalar_type() == at::kFloat && scale->numel() == 1 &&
+          scale->is_contiguous(),
+      "linear_tla_unsupported: scalar FP32 scale and no bias required");
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(input.data_ptr()) % 64 == 0 &&
+          reinterpret_cast<uintptr_t>(weight.data_ptr()) % 64 == 0,
+      "linear_tla_unsupported: A/B base must satisfy 64-byte 2D-I/O alignment");
+  const c10::DeviceGuard guard(input.device());
+  auto output = at::empty({m, n}, input.options());
+  at::Tensor partial;
+  if constexpr (!UseSlm)
+    partial = at::empty({kSplits, m, n}, input.options().dtype(at::kFloat));
+  const auto* a = reinterpret_cast<const ElementA*>(input.data_ptr<at::Half>());
+  const auto* b = reinterpret_cast<const ElementB*>(weight.data_ptr());
+  float* global_partial = UseSlm ? nullptr : partial.data_ptr<float>();
+  auto* out = reinterpret_cast<sycl::half*>(output.data_ptr<at::Half>());
+  const auto* s = scale->data_ptr<float>();
+  auto& queue = c10::xpu::getCurrentXPUStream(input.get_device()).queue();
+  constexpr int group_size = size(MMA{});
+  static_assert(group_size == kTileN);
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  const syclex::properties props{
+      syclex::sub_group_size<16>, intelex::grf_size<256>};
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> scratch;
+    if constexpr (UseSlm)
+      scratch = sycl::local_accessor<float, 1>(kSplits * m * kTileN, cgh);
+    cgh.parallel_for<NtSlmSplitKGemm<kTileNFused, kSplits>>(
+        sycl::nd_range<3>(
+            sycl::range<3>(1, n / kTileN, kSplits * group_size),
+            sycl::range<3>(1, 1, kSplits * group_size)),
+        props,
+        [=](sycl::nd_item<3> item) {
+          const int split = item.get_local_linear_id() / group_size;
+          const int tile_n = item.get_group(1);
+          const int tiles_k = k / kTileK;
+          const int chunk = (tiles_k + kSplits - 1) / kSplits;
+          const int k_begin = chunk * split;
+          const int k_end = k_begin + chunk;
+          auto A = make_tensor(
+              make_gmem_ptr(a),
+              make_layout(
+                  make_shape(int(m), int(k)), make_stride(int(k), _1{})));
+          auto B = make_tensor(
+              make_gmem_ptr(b),
+              make_layout(
+                  make_shape(int(n), int(k)), make_stride(int(k), _1{})));
+          float* p = global_partial;
+          if constexpr (UseSlm)
+            p = scratch.get_multi_ptr<sycl::access::decorated::no>().get();
+          // The SLM epilogue only needs C's shape to map accumulator
+          // coordinates.
+          float* c_pointer = UseSlm ? reinterpret_cast<float*>(out)
+                                    : p + int64_t(split) * m * n;
+          auto C = make_tensor(
+              make_gmem_ptr(c_pointer),
+              make_layout(
+                  make_shape(int(m), int(n)), make_stride(int(n), _1{})));
+          nt_split_mainloop<void, void, void, UseSlm>(
+              A,
+              B,
+              C,
+              make_coord(0, tile_n, _, 0),
+              MMA{},
+              k_begin,
+              k_end,
+              p,
+              int(m),
+              kTileN,
+              split);
+          // Every split for this N tile belongs to this workgroup; no global
+          // inter-workgroup barrier or counter is required.
+          item.barrier(
+              UseSlm ? sycl::access::fence_space::local_space
+                     : sycl::access::fence_space::global_and_local);
+          for (int index = item.get_local_linear_id(); index < m * kTileN;
+               index += kSplits * group_size) {
+            const int row = index / kTileN,
+                      col = tile_n * kTileN + index % kTileN;
+            float sum = 0.f;
+#pragma unroll
+            for (int part = 0; part < kSplits; ++part)
+              sum += UseSlm ? p[(part * m + row) * kTileN + col % kTileN]
+                            : p[(int64_t(part) * m + row) * n + col];
+            out[row * n + col] = sycl::half(sum * s[0]);
+          }
+        });
+  });
+  return output;
+}
+
 at::Tensor fp8_gemm_w8a16(
     const at::Tensor& input,
     const at::Tensor& weight,
@@ -228,9 +358,17 @@ at::Tensor fp8_gemm_w8a16(
       "linear_tla_unsupported: 2D tensors required");
   const auto n = weight.size(1);
   const auto k = input.size(1);
-  // M1 is latency-oriented: all six supported Gemma NT shapes use one
+  // M1 is latency-oriented: supported Gemma NT shapes use one
   // workgroup-local Split-K+reduce kernel. M2..8 keep the original branch.
   if (input.size(0) == 1) {
+    // Gemma31B TP2: keep split reduction in the same workgroup/kernel, with no
+    // global scratch.
+    if (k == 5376 && (n == 8192 || n == 10240 || n == 21504))
+      return fp8_gemm_slm_impl<32, 8>(input, weight, scale, bias);
+    if (n == 5376 && (k == 4096 || k == 8192))
+      return fp8_gemm_slm_impl<32, 2>(input, weight, scale, bias);
+    if (n == 5376 && k == 10752)
+      return fp8_gemm_slm_impl<64, 2>(input, weight, scale, bias);
     if (n == 5120 && k == 2816)
       return fp8_gemm_fused_impl<32, 2>(input, weight, scale, bias);
     if (n == 2816 && k == 4096)
@@ -267,10 +405,15 @@ bool supported(
   }
   const auto k = a.size(1);
   const auto n = b.size(1);
-  // All six Gemma TP2 NT shapes use TLA; other shapes retain the old API.
+  // New 31B shapes are enabled only for validated M1. Existing 26B
+  // coverage remains M1..8; unsupported contracts retain the original API.
+  const bool gemma31_m1 =
+      a.size(0) == 1 &&
+      ((k == 5376 && (n == 8192 || n == 10240 || n == 21504)) ||
+       (n == 5376 && (k == 4096 || k == 8192 || k == 10752)));
   if (!((n == 4096 && k == 2816) || (n == 2816 && k == 2048) ||
         (n == 5120 && k == 2816) || (n == 2816 && k == 4096) ||
-        (n == 2112 && k == 2816) || (n == 2816 && k == 1056))) {
+        (n == 2112 && k == 2816) || (n == 2816 && k == 1056) || gemma31_m1)) {
     return false;
   }
   if (reinterpret_cast<uintptr_t>(a.data_ptr()) % 64 != 0 ||

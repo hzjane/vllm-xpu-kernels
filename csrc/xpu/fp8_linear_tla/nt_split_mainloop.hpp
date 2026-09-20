@@ -45,6 +45,7 @@ template <
     class GmemTiledCopyA,
     class GmemTiledCopyB,
     class GmemTiledCopyC,
+    bool UseSlm = false,
     class ATensor,
     class BTensor,
     class DTensor,
@@ -56,7 +57,11 @@ CUTE_DEVICE void nt_split_mainloop(
     Coord<int, int, cute::Underscore, int> blk_coord,
     TiledMMA const& mma,
     int k_begin,
-    int k_end) {
+    int k_end,
+    float* partial = nullptr,
+    int m = 0,
+    int tile_n = 0,
+    int split = 0) {
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -80,12 +85,10 @@ CUTE_DEVICE void nt_split_mainloop(
 
   auto copy_a = get_block_2d_copy_A<GmemTiledCopyA>(mma, A);
   auto copy_b = get_block_2d_copy_B<GmemTiledCopyB>(mma, B);
-  auto copy_c = get_block_2d_copy_D<GmemTiledCopyC>(mma, C);
 
   auto thr_mma = mma.get_slice(local_id);
   auto thr_copy_a = copy_a.get_slice(local_id);
   auto thr_copy_b = copy_b.get_slice(local_id);
-  auto thr_copy_c = copy_c.get_slice(local_id);
 
   auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
   auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
@@ -98,8 +101,6 @@ CUTE_DEVICE void nt_split_mainloop(
 
   /* Partition C */
   auto tCrC = thr_mma.partition_sg_fragment_C(gC);
-  auto tCrC_out = thr_copy_c.partition_sg_fragment_S(gC);
-  auto tCgC = thr_copy_c.partition_D(gC);
 
   auto prefetch_a = make_block_2d_prefetch(copy_a);
   auto prefetch_b = make_block_2d_prefetch(copy_b);
@@ -144,8 +145,23 @@ CUTE_DEVICE void nt_split_mainloop(
     barrier_wait(barrier_scope);
   }
 
-  reorder(tCrC, tCrC_out);
-  copy(copy_c, tCrC_out, tCgC);
+  if constexpr (UseSlm) {
+    auto coords = thr_mma.partition_C(gC);
+    CUTE_UNROLL
+    for (int i = 0; i < size(tCrC.tensor()); ++i) {
+      auto xy = coords(i);
+      const int row = get<0>(xy), col = get<1>(xy);
+      if (row < m)
+        partial[(split * m + row) * tile_n + col % tile_n] = tCrC.tensor()(i);
+    }
+  } else {
+    auto copy_c = get_block_2d_copy_D<GmemTiledCopyC>(mma, C);
+    auto thr_copy_c = copy_c.get_slice(local_id);
+    auto tCrC_out = thr_copy_c.partition_sg_fragment_S(gC);
+    auto tCgC = thr_copy_c.partition_D(gC);
+    reorder(tCrC, tCrC_out);
+    copy(copy_c, tCrC_out, tCgC);
+  }
 }
 
 }  // namespace vllm::linear_tla
