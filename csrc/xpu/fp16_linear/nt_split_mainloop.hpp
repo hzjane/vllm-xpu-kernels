@@ -37,7 +37,8 @@
 #include <sycl/sycl.hpp>
 
 // Adapted from vllm-xpu-kernels v0.1.11.1 xe_gemm.
-// Direct physical [N,K] FP16 weights; FP32 accumulation, optional split-K output.
+// Direct physical [N,K] FP16 weights; FP32 accumulation, optional split-K
+// output.
 namespace vllm::fp16_linear_tla {
 using namespace cute;
 
@@ -52,7 +53,7 @@ template <
 CUTE_DEVICE void nt_split_mainloop(
     ATensor const& A,  // (M,K)
     BTensor const& B,  // (N,K)
-    DTensor& C,  // (M,N)
+    DTensor& C,        // (M,N)
     Coord<int, int, cute::Underscore, int> blk_coord,
     TiledMMA const& mma,
     int k_begin,
@@ -112,22 +113,21 @@ CUTE_DEVICE void nt_split_mainloop(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
-
   int k_tile_prefetch = k_begin;
 
   clear(tCrC);
 
   CUTE_UNROLL
-  for (; k_tile_prefetch < k_begin + prefetch_dist &&
-         k_tile_prefetch < k_end; k_tile_prefetch++) {
+  for (; k_tile_prefetch < k_begin + prefetch_dist && k_tile_prefetch < k_end;
+       k_tile_prefetch++) {
     prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
     prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
   }
 
+  // A/B fragments and accumulators are subgroup-private. The 2D loads
+  // and DPAS operations do not communicate across subgroups, so no
+  // workgroup barrier is needed in this register-only loop.
   for (int k_tile = k_begin; k_tile < k_end; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
-
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
@@ -140,8 +140,6 @@ CUTE_DEVICE void nt_split_mainloop(
     reorder(tBrB, tCrB);
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
-
-    barrier_wait(barrier_scope);
   }
 
   reorder(tCrC, tCrC_out);
