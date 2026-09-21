@@ -113,8 +113,6 @@ CUTE_DEVICE void nt_split_mainloop(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
-
   int k_tile_prefetch = k_begin;
 
   clear(tCrC);
@@ -126,9 +124,10 @@ CUTE_DEVICE void nt_split_mainloop(
     prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
   }
 
+  // A/B fragments and accumulators are subgroup-private. The 2D loads
+  // and DPAS operations do not communicate across subgroups, so no
+  // workgroup barrier is needed in this register-only loop.
   for (int k_tile = k_begin; k_tile < k_end; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
-
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
     copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
@@ -141,8 +140,6 @@ CUTE_DEVICE void nt_split_mainloop(
     reorder(tBrB, tCrB);
 
     cute::gemm(mma, tCrA, tCrB, tCrC);
-
-    barrier_wait(barrier_scope);
   }
 
   reorder(tCrC, tCrC_out);

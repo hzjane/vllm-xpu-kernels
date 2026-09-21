@@ -358,17 +358,16 @@ at::Tensor fp8_gemm_w8a16(
       "linear_tla_unsupported: 2D tensors required");
   const auto n = weight.size(1);
   const auto k = input.size(1);
-  // M1 is latency-oriented: supported Gemma NT shapes use one
-  // workgroup-local Split-K+reduce kernel. M2..8 keep the original branch.
+  // Gemma31B TP2 M1..8: reduce Split-K partials within the same workgroup.
+  // All selection has already been checked by supported().
+  if (k == 5376 && (n == 8192 || n == 10240 || n == 21504))
+    return fp8_gemm_slm_impl<32, 8>(input, weight, scale, bias);
+  if (n == 5376 && (k == 4096 || k == 8192))
+    return fp8_gemm_slm_impl<32, 2>(input, weight, scale, bias);
+  if (n == 5376 && k == 10752)
+    return fp8_gemm_slm_impl<64, 2>(input, weight, scale, bias);
+  // Keep the established Gemma26B M1 and M2..8 policies.
   if (input.size(0) == 1) {
-    // Gemma31B TP2: keep split reduction in the same workgroup/kernel, with no
-    // global scratch.
-    if (k == 5376 && (n == 8192 || n == 10240 || n == 21504))
-      return fp8_gemm_slm_impl<32, 8>(input, weight, scale, bias);
-    if (n == 5376 && (k == 4096 || k == 8192))
-      return fp8_gemm_slm_impl<32, 2>(input, weight, scale, bias);
-    if (n == 5376 && k == 10752)
-      return fp8_gemm_slm_impl<64, 2>(input, weight, scale, bias);
     if (n == 5120 && k == 2816)
       return fp8_gemm_fused_impl<32, 2>(input, weight, scale, bias);
     if (n == 2816 && k == 4096)
@@ -405,15 +404,15 @@ bool supported(
   }
   const auto k = a.size(1);
   const auto n = b.size(1);
-  // New 31B shapes are enabled only for validated M1. Existing 26B
-  // coverage remains M1..8; unsupported contracts retain the original API.
-  const bool gemma31_m1 =
-      a.size(0) == 1 &&
+  // Both Gemma shape families support M1..8; unsupported tensor contracts
+  // retain the original API before any device submission.
+  const bool gemma31_small_m =
       ((k == 5376 && (n == 8192 || n == 10240 || n == 21504)) ||
        (n == 5376 && (k == 4096 || k == 8192 || k == 10752)));
   if (!((n == 4096 && k == 2816) || (n == 2816 && k == 2048) ||
         (n == 5120 && k == 2816) || (n == 2816 && k == 4096) ||
-        (n == 2112 && k == 2816) || (n == 2816 && k == 1056) || gemma31_m1)) {
+        (n == 2112 && k == 2816) || (n == 2816 && k == 1056) ||
+        gemma31_small_m)) {
     return false;
   }
   if (reinterpret_cast<uintptr_t>(a.data_ptr()) % 64 != 0 ||
