@@ -211,6 +211,114 @@ std::vector<at::Tensor> mha_varlen_fwd(
   at::Tensor seqlens_k = is_paged ? *seqused_k : cu_seqlens_k;
   bool is_prefill_only = (!mix_batch && max_seqlen_q > 1) | !is_paged;
 
+  // Small-M causal verification is a batch of single-query decodes against
+  // progressively longer KV prefixes. Build the metadata on the current
+  // stream: no host readback, cache copy, or change to vLLM is required.
+  const bool small_m_decode =
+      vllm::xpu::is_xe2_arch() && is_paged && is_causal && !is_sink &&
+      !return_softmax && p_dropout == 0.0 && max_seqlen_q >= 2 &&
+      max_seqlen_q <= 8 && q.size(0) == max_seqlen_q &&
+      cu_seqlens_q.numel() == 2 && seqlens_k.numel() == 1 &&
+      q_type == at::kHalf && k_type == at::kHalf &&
+      v.scalar_type() == at::kHalf && q.is_contiguous() &&
+      seqlens_k.is_contiguous() && block_table.is_contiguous() &&
+      block_table.size(0) == 1 && block_table.size(1) > 0 &&
+      (!out_.has_value() ||
+       (out.is_contiguous() && out.sizes() == q.sizes())) &&
+      !splits_per_seq.has_value() && !work_list.has_value() &&
+      max_seqlen_k >= 16384 && max_seqlen_k <= 40960 &&
+      ((q.size(2) == 256 && v.size(3) == 256 && k.size(1) == 32 &&
+        (q.size(1) == 8 || q.size(1) == 16) && q.size(1) == 2 * k.size(2) &&
+        window_size_left == 1023 && window_size_right == 0) ||
+       (q.size(2) == 512 && v.size(3) == 512 && k.size(1) == 64 &&
+        (q.size(1) == 8 || q.size(1) == 16) && q.size(1) == 8 * k.size(2) &&
+        !is_local));
+  if (small_m_decode) {
+    const int tokens = q.size(0), heads = q.size(1), dim = q.size(2);
+    const int pages = block_table.size(1);
+    auto tables = at::empty({tokens, pages}, block_table.options());
+    auto lengths = at::empty({tokens}, seqlens_k.options());
+    auto offsets = at::empty({tokens + 1}, cu_seqlens_q.options());
+    auto empty_rows = at::empty({tokens}, q.options().dtype(at::kBool));
+    if (!out_.has_value()) out = at::empty_like(q);
+    auto* output = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
+    auto* skip = empty_rows.data_ptr<bool>();
+    auto* dst = tables.data_ptr<int>();
+    auto* lens = lengths.data_ptr<int>();
+    auto* cu = offsets.data_ptr<int>();
+    const auto* src = block_table.data_ptr<int>();
+    const auto* original_length = seqlens_k.data_ptr<int>();
+    queue.parallel_for(sycl::range<1>(tokens * pages), [=](sycl::id<1> tid) {
+      const int i = tid[0];
+      dst[i] = src[i % pages];
+      const int row = i / pages;
+      // Fully masked causal rows have zero output. The existing decode mask
+      // also skips their split reduction, avoiding an all-negative-inf merge.
+      if (original_length[0] - tokens + row + 1 <= 0) {
+        for (int col = i % pages; col < heads * dim; col += pages)
+          output[row * heads * dim + col] = sycl::half(0);
+      }
+      if (i < tokens) {
+        lens[i] = sycl::max(0, original_length[0] - tokens + i + 1);
+        cu[i] = i;
+        skip[i] = lens[i] == 0;
+      }
+      if (i == 0) cu[tokens] = tokens;
+    });
+    const int left = is_local ? window_size_left : max_seqlen_k;
+    const int right = is_local ? window_size_right : max_seqlen_k;
+    const int effective_k =
+        is_local ? std::min(max_seqlen_k, left + 1) : max_seqlen_k;
+    const int splits = num_splits.value_or(
+        is_local ? 16
+                 : get_num_splits(
+                       queue,
+                       tokens,
+                       heads,
+                       k.size(2),
+                       effective_k,
+                       k.size(1),
+                       is_local,
+                       false));
+    auto partial = splits == 1
+                       ? out
+                       : at::empty({tokens, heads * splits, dim}, q.options());
+    auto maxima =
+        at::empty({tokens, heads, splits}, q.options().dtype(at::kFloat));
+    auto sums = at::empty_like(maxima);
+    std::optional<const at::Tensor> skip_empty = empty_rows;
+    cutlass_paged_decode_interface(
+        queue,
+        q,
+        k,
+        v,
+        out,
+        partial,
+        sums,
+        maxima,
+        tables,
+        offsets,
+        lengths,
+        1,
+        max_seqlen_k,
+        k_scale,
+        v_scale,
+        softmax_scale,
+        softmax_sink_,
+        left,
+        right,
+        true,
+        true,
+        false,
+        is_local,
+        false,
+        splits,
+        skip_empty,
+        splits_per_seq,
+        work_list);
+    return {out, at::Tensor()};
+  }
+
   if (is_prefill_only) {
     if (!out_.has_value()) {
       out = torch::empty_like(q);
