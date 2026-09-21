@@ -286,8 +286,12 @@ std::vector<at::Tensor> mha_varlen_fwd(
     const int right = is_local ? window_size_right : max_seqlen_k;
     const int effective_k =
         is_local ? std::min(max_seqlen_k, left + 1) : max_seqlen_k;
+    // With 64-token pages, M5 GQA2 has enough work without splitting the
+    // 1024-token local window. Avoid partial-output traffic and its reduction.
+    const int local_splits =
+        tokens == 5 && heads == 16 && k.size(1) == 64 ? 1 : 16;
     const int splits = num_splits.value_or(
-        is_local ? 16
+        is_local ? local_splits
                  : get_num_splits(
                        queue,
                        tokens,
