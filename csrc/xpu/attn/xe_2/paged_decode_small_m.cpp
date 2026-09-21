@@ -13,8 +13,7 @@ bool try_paged_decode_small_m_xe2(
     const at::Tensor& value,
     at::Tensor& out,
     at::Tensor& temporary,
-    at::Tensor& exp_sums,
-    at::Tensor& max_logits,
+    at::Tensor& softmax_lse_accum,
     const at::Tensor& block_table,
     const at::Tensor& cu_seqlens_q,
     const at::Tensor& seqlens_k,
@@ -49,11 +48,10 @@ bool try_paged_decode_small_m_xe2(
       !temporary.is_contiguous() ||
       temporary.numel() !=
           query.size(0) * query.size(1) * num_kv_splits * 512 ||
-      exp_sums.scalar_type() != at::kFloat ||
-      max_logits.scalar_type() != at::kFloat || !exp_sums.is_contiguous() ||
-      !max_logits.is_contiguous() ||
-      exp_sums.numel() != query.size(0) * query.size(1) * num_kv_splits ||
-      max_logits.numel() != query.size(0) * query.size(1) * num_kv_splits ||
+      softmax_lse_accum.scalar_type() != at::kFloat ||
+      !softmax_lse_accum.is_contiguous() ||
+      softmax_lse_accum.numel() !=
+          query.size(0) * query.size(1) * num_kv_splits ||
       block_table.scalar_type() != at::kInt || !block_table.is_contiguous() ||
       block_table.dim() != 2 || block_table.size(0) != query.size(0) ||
       cu_seqlens_q.scalar_type() != at::kInt || !cu_seqlens_q.is_contiguous() ||
@@ -70,8 +68,7 @@ bool try_paged_decode_small_m_xe2(
   args.value = value.data_ptr();
   args.out = out.data_ptr();
   args.tem_out = temporary.data_ptr();
-  args.exp_sums = exp_sums.data_ptr();
-  args.max_logits = max_logits.data_ptr();
+  args.softmax_lse_accum = softmax_lse_accum.data_ptr();
   args.block_table = block_table.data_ptr();
   args.cu_seqlens_q = cu_seqlens_q.data_ptr();
   args.cu_seqlens_k = seqlens_k.data_ptr();

@@ -231,8 +231,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
   // stream: no host readback, cache copy, or change to vLLM is required.
   const bool small_m_decode =
       vllm::xpu::is_xe2_arch() && is_paged && is_causal && !is_sink &&
-      !return_softmax && p_dropout == 0.0 && max_seqlen_q >= 2 &&
-      max_seqlen_q <= 8 && q.size(0) == max_seqlen_q &&
+      !return_softmax && !q_scale.has_value() && p_dropout == 0.0 &&
+      max_seqlen_q >= 2 && max_seqlen_q <= 8 && q.size(0) == max_seqlen_q &&
       cu_seqlens_q.numel() == 2 && seqlens_k.numel() == 1 &&
       q_type == at::kHalf && k_type == at::kHalf &&
       v.scalar_type() == at::kHalf && q.is_contiguous() &&
@@ -298,9 +298,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
     auto partial = splits == 1
                        ? out
                        : at::empty({tokens, heads * splits, dim}, q.options());
-    auto maxima =
+    auto partial_lse =
         at::empty({tokens, heads, splits}, q.options().dtype(at::kFloat));
-    auto sums = at::empty_like(maxima);
     std::optional<const at::Tensor> skip_empty = empty_rows;
     cutlass_paged_decode_interface(
         queue,
@@ -309,13 +308,13 @@ std::vector<at::Tensor> mha_varlen_fwd(
         v,
         out,
         partial,
-        sums,
-        maxima,
+        partial_lse,
         tables,
         offsets,
         lengths,
         1,
         max_seqlen_k,
+        q_scale,
         k_scale,
         v_scale,
         softmax_scale,
@@ -330,7 +329,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         splits,
         skip_empty,
         splits_per_seq,
-        work_list);
+        work_list,
+        softmax_lse_opt);
     return {out, at::Tensor()};
   }
 

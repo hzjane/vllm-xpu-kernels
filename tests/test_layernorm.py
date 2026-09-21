@@ -297,7 +297,7 @@ def test_nemotron_layer_norm(
 @pytest.mark.parametrize("offset", [0, 1])
 @torch.inference_mode()
 def test_small_m_rms_strided_current_stream(batch, width, weighted, offset):
-    """Decode norm must preserve FP16 rounding and sliced QKV row strides."""
+    """Match FP32 weighting and preserve sliced QKV row strides."""
     if not hasattr(torch.ops._xpu_C, "rms_norm_small_m"):
         pytest.skip("Optional RMS extension was not built")
     generator = torch.Generator(device="cpu").manual_seed(19)
@@ -308,9 +308,9 @@ def test_small_m_rms_strided_current_stream(batch, width, weighted, offset):
                          device="cpu").half() if weighted else None
     f = view.float()
     expected = (f * torch.rsqrt(f.square().mean(-1, keepdim=True)
-                               + 1e-6)).half()
+                               + 1e-6))
     if weight is not None:
-        expected = (expected * weight).half()
+        expected = expected * weight.float()
     stream = torch.xpu.Stream()
     with torch.xpu.stream(stream):
         x = cpu.to("xpu")[..., offset:offset + width]
@@ -319,8 +319,10 @@ def test_small_m_rms_strided_current_stream(batch, width, weighted, offset):
         output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
         torch.ops._xpu_C.rms_norm_small_m.out(output, x, w, 1e-6)
     stream.synchronize()
-    torch.testing.assert_close(actual.cpu(), expected, atol=2e-3, rtol=2e-3)
-    torch.testing.assert_close(output.cpu(), expected, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        actual.cpu(), expected.half(), atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        output.cpu(), expected.half(), atol=2e-3, rtol=2e-3)
     assert actual.is_contiguous()
 
 
