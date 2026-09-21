@@ -28,11 +28,12 @@ from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
         (5, 32773, None, False, False, False),
     ],
 )
+@pytest.mark.parametrize("page_factor", [1, 2])
 @torch.inference_mode()
 def test_small_m_causal_paged_attention(
-    heads, dim, m, length, splits, lse, single_queries, causal
+    heads, dim, m, length, splits, lse, single_queries, causal, page_factor
 ):
-    page = 32 if dim == 256 else 64
+    page = (32 if dim == 256 else 64) * page_factor
     kv = heads // (2 if dim == 256 else 8)
     pages = max(1, (length + page - 1) // page)
     generator = torch.Generator().manual_seed(length + m + heads)
@@ -122,12 +123,13 @@ def test_small_m_causal_paged_attention(
 @pytest.mark.parametrize(
     "heads,dim", [(8, 256), (16, 256), (8, 512), (16, 512)]
 )
+@pytest.mark.parametrize("page_factor", [1, 2])
 @torch.inference_mode()
-def test_small_m_attention_boundary_signal(heads, dim):
+def test_small_m_attention_boundary_signal(heads, dim, page_factor):
     # Future keys have deliberately larger scores and distinct values. A
     # missing causal mask must change the result by order-one amounts.
     m, length = 5, 32773
-    page = 32 if dim == 256 else 64
+    page = (32 if dim == 256 else 64) * page_factor
     kv = heads // (2 if dim == 256 else 8)
     pages = (length + page - 1) // page
     k = torch.zeros(pages * page, kv, dim, dtype=torch.float16)

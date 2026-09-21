@@ -543,10 +543,10 @@ def flash_attn_varlen_func(
             and seqused_k is not None and seqused_k.is_contiguous()
             and q.shape[1] in (8, 16)
             and ((q.shape[2] == v.shape[-1] == 512
-                  and k.shape[1] == 64 and q.shape[1] == 8 * k.shape[2]
+                  and k.shape[1] in (64, 128) and q.shape[1] == 8 * k.shape[2]
                   and real_window_size == (-1, -1))
                  or (q.shape[2] == v.shape[-1] == 256
-                     and k.shape[1] == 32 and q.shape[1] == 2 * k.shape[2]
+                     and k.shape[1] in (32, 64) and q.shape[1] == 2 * k.shape[2]
                      and real_window_size == (1023, 0)))
             and hasattr(torch.ops._xpu_C, "is_xe2_arch")
             and torch.ops._xpu_C.is_xe2_arch()
