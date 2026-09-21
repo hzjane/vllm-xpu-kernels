@@ -21,7 +21,8 @@ bool try_paged_decode_small_m_xe2(
     int max_seqlen_q,
     int max_seqlen_k,
     int num_kv_splits,
-    double softmax_scale) {
+    double softmax_scale,
+    const bool* skip_rows) {
 #if __has_include("paged_decode_enabled_policies_gen.hpp")
   // Respect selective builds just like the general decode dispatcher.
   if constexpr (!is_decode_policy_tuple_enabled<
@@ -32,13 +33,13 @@ bool try_paged_decode_small_m_xe2(
     return false;
   }
 #endif
-  // Bound the policy to the measured single-token FP16 GQA case. All other
-  // shapes retain the existing general dispatch, including explicit split
-  // counts outside the tuned range.
+  // FP16 GQA8 single-query sequences, including small-M verification
+  // expanded by the public wrapper. Keep unsupported split plans unchanged.
   if (query.scalar_type() != at::kHalf || key.scalar_type() != at::kHalf ||
       value.scalar_type() != at::kHalf || query.dim() != 3 ||
-      query.size(0) != 1 || query.size(1) != 16 || query.size(2) != 512 ||
-      key.dim() != 4 || key.size(1) != 64 || key.size(2) != 2 ||
+      query.size(0) < 1 || query.size(0) > 8 ||
+      (query.size(1) != 8 && query.size(1) != 16) || query.size(2) != 512 ||
+      key.dim() != 4 || key.size(1) != 64 || key.size(2) * 8 != query.size(1) ||
       key.size(3) != 512 || value.sizes() != key.sizes() || max_seqlen_q != 1 ||
       max_seqlen_k < 16384 || max_seqlen_k > 40960 ||
       (num_kv_splits != 8 && num_kv_splits != 16 && num_kv_splits != 32) ||
@@ -46,16 +47,19 @@ bool try_paged_decode_small_m_xe2(
       out.scalar_type() != at::kHalf || out.sizes() != query.sizes() ||
       !out.is_contiguous() || temporary.scalar_type() != at::kHalf ||
       !temporary.is_contiguous() ||
-      temporary.numel() != 16 * num_kv_splits * 512 ||
+      temporary.numel() !=
+          query.size(0) * query.size(1) * num_kv_splits * 512 ||
       exp_sums.scalar_type() != at::kFloat ||
       max_logits.scalar_type() != at::kFloat || !exp_sums.is_contiguous() ||
-      !max_logits.is_contiguous() || exp_sums.numel() != 16 * num_kv_splits ||
-      max_logits.numel() != 16 * num_kv_splits ||
+      !max_logits.is_contiguous() ||
+      exp_sums.numel() != query.size(0) * query.size(1) * num_kv_splits ||
+      max_logits.numel() != query.size(0) * query.size(1) * num_kv_splits ||
       block_table.scalar_type() != at::kInt || !block_table.is_contiguous() ||
-      block_table.dim() != 2 || block_table.size(0) != 1 ||
+      block_table.dim() != 2 || block_table.size(0) != query.size(0) ||
       cu_seqlens_q.scalar_type() != at::kInt || !cu_seqlens_q.is_contiguous() ||
-      cu_seqlens_q.numel() != 2 || seqlens_k.scalar_type() != at::kInt ||
-      !seqlens_k.is_contiguous() || seqlens_k.numel() != 1) {
+      cu_seqlens_q.numel() != query.size(0) + 1 ||
+      seqlens_k.scalar_type() != at::kInt || !seqlens_k.is_contiguous() ||
+      seqlens_k.numel() != query.size(0)) {
     return false;
   }
   check_paged_kv_cache_strides(key, value);
@@ -73,13 +77,13 @@ bool try_paged_decode_small_m_xe2(
   args.cu_seqlens_k = seqlens_k.data_ptr();
   args.max_queries = 1;
   args.max_keys = max_seqlen_k;
-  args.total_seqlen_q = 1;
+  args.total_seqlen_q = query.size(0);
   args.total_seqlen_k =
       static_cast<int>(get_paged_kv_cache_effective_total_seqlen(key));
   args.sm_scale = static_cast<float>(softmax_scale);
-  args.batch_size = 1;
-  args.num_heads_q = 16;
-  args.num_heads_k = 2;
+  args.batch_size = query.size(0);
+  args.num_heads_q = query.size(1);
+  args.num_heads_k = key.size(2);
   args.head_size = 512;
   args.v_head_size = 512;
   args.max_blocks_per_seq = block_table.size(1);
@@ -88,6 +92,7 @@ bool try_paged_decode_small_m_xe2(
   args.window_size_right = max_seqlen_k;
   args.is_varlen = true;
   args.is_paged = true;
+  args.is_prefill = const_cast<bool*>(skip_rows);
   args.num_kv_splits = num_kv_splits;
   args.k_stride_page = key.stride(0);
   args.k_stride_seq = key.stride(1);
