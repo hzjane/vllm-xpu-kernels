@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-from contextlib import nullcontext
-
 import pytest
 import torch
 
@@ -41,11 +39,13 @@ def test_small_m_causal_paged_attention(
     k = (torch.randn(pages * page, kv, dim, generator=generator) * 0.2).half()
     v = (torch.randn(pages * page, kv, dim, generator=generator) * 0.2).half()
     expected = []
+    expected_lse = []
     for i in range(m):
         end = max(0, length - m + i + 1) if causal or dim == 256 else length
         start = max(0, end - 1024) if dim == 256 else 0
         if end == 0:
             expected.append(torch.zeros(heads, dim))
+            expected_lse.append(torch.full((heads,), -torch.inf))
         else:
             kr = k[start:end].float().permute(1, 0, 2)
             vr = v[start:end].float().permute(1, 0, 2)
@@ -53,6 +53,7 @@ def test_small_m_causal_paged_attention(
                 1, 2
             )
             expected.append((scores.softmax(-1) @ vr).reshape(heads, dim))
+            expected_lse.append(scores.logsumexp(-1).reshape(heads))
     stream = torch.xpu.Stream()
     with torch.xpu.stream(stream):
         # Match the server interleaved KV layout, including the V offset.
@@ -76,37 +77,34 @@ def test_small_m_causal_paged_attention(
             if single_queries
             else device_ids.int()[None]
         )
-        # Preserve the existing paged-LSE rejection.
-        context = (
-            pytest.raises(RuntimeError, match="softmax_lse output")
-            if lse
-            else nullcontext()
+        result = flash_attn_varlen_func(
+            dq,
+            dk,
+            dv,
+            max_seqlen_q=1 if single_queries else m,
+            cu_seqlens_q=torch.tensor(
+                offsets, device="xpu", dtype=torch.int32
+            ),
+            max_seqlen_k=max(16384, length),
+            seqused_k=torch.tensor(
+                lengths, device="xpu", dtype=torch.int32
+            ),
+            block_table=tables,
+            causal=causal,
+            softmax_scale=1.0,
+            window_size=(1023, 0) if dim == 256 else (-1, -1),
+            num_splits_kv=splits,
+            return_softmax_lse=lse,
+            out=out,
         )
-        with context:
-            result = flash_attn_varlen_func(
-                dq,
-                dk,
-                dv,
-                max_seqlen_q=1 if single_queries else m,
-                cu_seqlens_q=torch.tensor(
-                    offsets, device="xpu", dtype=torch.int32
-                ),
-                max_seqlen_k=max(16384, length),
-                seqused_k=torch.tensor(
-                    lengths, device="xpu", dtype=torch.int32
-                ),
-                block_table=tables,
-                causal=causal,
-                softmax_scale=1.0,
-                window_size=(1023, 0) if dim == 256 else (-1, -1),
-                num_splits_kv=splits,
-                return_softmax_lse=lse,
-                out=out,
-            )
     stream.synchronize()
     if lse:
-        return
-    actual = result
+        actual, actual_lse = result
+        torch.testing.assert_close(
+            actual_lse.cpu(), torch.stack(expected_lse, dim=1),
+            atol=2e-3, rtol=1e-3)
+    else:
+        actual = result
     assert actual.data_ptr() == out.data_ptr()
     torch.testing.assert_close(
         actual.cpu().float(), torch.stack(expected), atol=2e-3, rtol=1e-2
