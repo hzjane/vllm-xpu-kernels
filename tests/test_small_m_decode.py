@@ -8,7 +8,7 @@ import vllm_xpu_kernels._C  # noqa: F401
 import vllm_xpu_kernels._xpu_C  # noqa: F401
 
 
-@pytest.mark.parametrize("m", [1, 2, 8])
+@pytest.mark.parametrize("m", [1, 2, 5, 8])
 @pytest.mark.parametrize("width", [256, 512, 2816, 5376])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("offset", [0, 1])

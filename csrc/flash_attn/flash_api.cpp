@@ -471,6 +471,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
     int batch_size = static_cast<int>(cu_seqlens_q.size(0)) - 1;
     int num_heads_q = q.size(1);
     int v_head_dim = v.size(-1);
+    const int head_size_qk = q.size(2);
     int num_heads_kv = k.size(2);
     int block_size = k.size(1);
 

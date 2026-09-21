@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import sys
+from importlib.util import find_spec
 from typing import Optional
 
 import torch
+
+# Architecture dispatch is also needed when attention is imported on its own.
+if find_spec(f"{__package__}._xpu_C") is not None:
+    from . import _xpu_C  # noqa: F401
 
 #isort: off
 try:
@@ -543,6 +548,7 @@ def flash_attn_varlen_func(
                  or (q.shape[2] == v.shape[-1] == 256
                      and k.shape[1] == 32 and q.shape[1] == 2 * k.shape[2]
                      and real_window_size == (1023, 0)))
+            and hasattr(torch.ops._xpu_C, "is_xe2_arch")
             and torch.ops._xpu_C.is_xe2_arch()
         )
         # TODO: We could also support the case where q_descale is not None.
