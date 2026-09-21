@@ -137,7 +137,8 @@ void cutlass_paged_decode_interface(
 #ifdef VLLM_XPU_ENABLE_XE2
     if (vllm::xpu::is_xe2_arch() && is_varlen && is_paged && !is_causal &&
         !is_local && !is_sink && !splits_per_seq.has_value() &&
-        !work_list.has_value() &&
+        !work_list.has_value() && !softmax_lse.has_value() &&
+        !q_scale.has_value() &&
         try_paged_decode_small_m_xe2(
             queue,
             query,
@@ -145,8 +146,7 @@ void cutlass_paged_decode_interface(
             value_cache,
             out,
             temp_out,
-            exp_sums,
-            max_logits,
+            softmax_lse_accum,
             block_table,
             cu_seqlens_q,
             cu_seqlens_k,

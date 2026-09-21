@@ -72,14 +72,14 @@ struct SmallMRms {
 #pragma unroll
       for (int i = 0; i < 8; ++i) {
         const int column = chunk * 8 + i;
-        // Preserve the existing FP16 normalization/weighting boundary.
-        sycl::half value = sycl::half(float(values[p].values[i]) * inverse_rms);
+        // Match current upstream: weight in FP32, then cast once.
+        float value = float(values[p].values[i]) * inverse_rms;
         if constexpr (Weighted) {
           const float w =
               Aligned ? float(weights.values[i]) : float(weight[column]);
-          value = sycl::half(float(value) * w);
+          value *= w;
         }
-        result.values[i] = value;
+        result.values[i] = sycl::half(value);
       }
       if constexpr (Aligned)
         reinterpret_cast<Half8*>(output + row * Width)[chunk] = result;

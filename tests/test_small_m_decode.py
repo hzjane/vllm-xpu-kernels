@@ -20,11 +20,11 @@ def test_rms_decode_strided(m, width, weighted, offset):
     weight = torch.randn(width).half().to("xpu") if weighted else None
     ref = x.cpu().float()
     ref = (ref * torch.rsqrt(ref.square().mean(-1, keepdim=True)
-                             + 1e-6)).half()
+                             + 1e-6))
     if weight is not None:
-        ref = (ref * weight.cpu()).half()
+        ref = ref * weight.cpu().float()
     y = torch.ops._xpu_C.rms_norm_decode_dispatch(x, weight, 1e-6)
-    torch.testing.assert_close(y.cpu(), ref, rtol=1e-3, atol=2e-3)
+    torch.testing.assert_close(y.cpu(), ref.half(), rtol=1e-3, atol=2e-3)
 
 
 # Existing TP2 shapes exercise both M1 fused reduction and M2..8 Split-K.
