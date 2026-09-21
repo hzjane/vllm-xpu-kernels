@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -77,27 +79,33 @@ def test_small_m_causal_paged_attention(
             if single_queries
             else device_ids.int()[None]
         )
-        result = flash_attn_varlen_func(
-            dq,
-            dk,
-            dv,
-            max_seqlen_q=1 if single_queries else m,
-            cu_seqlens_q=torch.tensor(
-                offsets, device="xpu", dtype=torch.int32
-            ),
-            max_seqlen_k=max(16384, length),
-            seqused_k=torch.tensor(
-                lengths, device="xpu", dtype=torch.int32
-            ),
-            block_table=tables,
-            causal=causal,
-            softmax_scale=1.0,
-            window_size=(1023, 0) if dim == 256 else (-1, -1),
-            num_splits_kv=splits,
-            return_softmax_lse=lse,
-            out=out,
-        )
+        # Current upstream supports global LSE; local prefill still rejects it.
+        context = (pytest.raises(RuntimeError, match="softmax_lse output")
+                   if lse and dim == 256 else nullcontext())
+        with context:
+            result = flash_attn_varlen_func(
+                dq,
+                dk,
+                dv,
+                max_seqlen_q=1 if single_queries else m,
+                cu_seqlens_q=torch.tensor(
+                    offsets, device="xpu", dtype=torch.int32
+                ),
+                max_seqlen_k=max(16384, length),
+                seqused_k=torch.tensor(
+                    lengths, device="xpu", dtype=torch.int32
+                ),
+                block_table=tables,
+                causal=causal,
+                softmax_scale=1.0,
+                window_size=(1023, 0) if dim == 256 else (-1, -1),
+                num_splits_kv=splits,
+                return_softmax_lse=lse,
+                out=out,
+            )
     stream.synchronize()
+    if lse and dim == 256:
+        return
     if lse:
         actual, actual_lse = result
         torch.testing.assert_close(

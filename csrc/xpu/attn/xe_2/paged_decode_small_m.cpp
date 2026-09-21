@@ -22,6 +22,7 @@ bool try_paged_decode_small_m_xe2(
     int num_kv_splits,
     double softmax_scale,
     const bool* skip_rows) {
+  using namespace vllm::xpu::xe2;
 #if __has_include("paged_decode_enabled_policies_gen.hpp")
   // Respect selective builds just like the general decode dispatcher.
   if constexpr (!is_decode_policy_tuple_enabled<

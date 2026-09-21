@@ -113,7 +113,7 @@ CUTE_DEVICE void nt_split_mainloop(
 
   const int prefetch_dist = 3;
 
-  constexpr int barrier_scope = 2;
+  constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
 
   int k_tile_prefetch = k_begin;
 
