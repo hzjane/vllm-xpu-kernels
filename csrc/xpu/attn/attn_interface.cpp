@@ -136,8 +136,8 @@ void cutlass_paged_decode_interface(
   if (vllm::xpu::is_xe2_arch() || vllm::xpu::is_xe3_arch()) {
 #ifdef VLLM_XPU_ENABLE_XE2
     if (vllm::xpu::is_xe2_arch() && is_varlen && is_paged && !is_causal &&
-        !is_local && !is_sink && !is_prefill.has_value() &&
-        !splits_per_seq.has_value() && !work_list.has_value() &&
+        !is_local && !is_sink && !splits_per_seq.has_value() &&
+        !work_list.has_value() &&
         try_paged_decode_small_m_xe2(
             queue,
             query,
@@ -153,7 +153,8 @@ void cutlass_paged_decode_interface(
             max_seqlen_q,
             max_seqlen_k,
             num_kv_splits,
-            sm_scale)) {
+            sm_scale,
+            is_prefill.has_value() ? is_prefill->data_ptr<bool>() : nullptr)) {
       return;
     }
     // Use XE2 cutlass kernel (also used as WA for XE3/XE3P)

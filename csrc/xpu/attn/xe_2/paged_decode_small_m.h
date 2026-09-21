@@ -20,4 +20,5 @@ bool try_paged_decode_small_m_xe2(
     int max_seqlen_q,
     int max_seqlen_k,
     int num_kv_splits,
-    double softmax_scale);
+    double softmax_scale,
+    const bool* skip_rows);
