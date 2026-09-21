@@ -385,14 +385,13 @@ at::Tensor rms_dispatch(
                            .typed<F>();
     return fast.call(x, weight, eps);
   }
-  auto w = weight ? *weight : at::ones({x.size(-1)}, x.options());
   auto out = at::empty(x.sizes(), x.options());
-  using F = void(at::Tensor&, at::Tensor&, at::Tensor&, double);
+  using F = void(at::Tensor&, at::Tensor&, std::optional<at::Tensor>, double);
   static auto old = c10::Dispatcher::singleton()
                         .findSchemaOrThrow("_C::rms_norm", "")
                         .typed<F>();
   at::Tensor input = x;
-  old.call(out, input, w, eps);
+  old.call(out, input, weight, eps);
   return out;
 }
 }  // namespace
