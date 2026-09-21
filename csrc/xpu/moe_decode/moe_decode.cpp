@@ -32,6 +32,28 @@ struct alignas(8) Half4 {
   sycl::half v[4];
 };
 
+// The M5 tiles fit in 128 GRFs. Preserve the established 256-GRF kernels
+// for other batch sizes and use the same GRF mode for the M5 vector helpers.
+template <int Dimensions, typename Kernel>
+struct Register128 {
+  Kernel kernel;
+  auto get(sycl::ext::oneapi::experimental::properties_tag) const {
+    return sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::sub_group_size<32>,
+        sycl::ext::intel::experimental::grf_size<128>};
+  }
+  void operator()(sycl::nd_item<Dimensions> item) const { kernel(item); }
+};
+
+template <typename Name, bool Narrow, int Dimensions, typename Kernel>
+void submit_vector(
+    sycl::queue& q, sycl::nd_range<Dimensions> range, Kernel kernel) {
+  if constexpr (Narrow)
+    q.parallel_for<Name>(range, Register128<Dimensions, Kernel>{kernel});
+  else
+    q.parallel_for<Name>(range, kernel);
+}
+
 template <bool Gate, bool Grouped, int Variant>
 void gemm(
     sycl::queue& q,
@@ -41,10 +63,9 @@ void gemm(
     const at::Tensor& ids,
     at::Tensor& output,
     const int* tile_map) {
-  using Policy = std::conditional_t<
-      Gate && Variant != 4,
-      GateUpPolicy<Variant>,
-      MoE::w8a16_policy_m_8>;
+  constexpr bool FusedGate = Gate && Variant < 4;
+  using Policy = std::
+      conditional_t<FusedGate, GateUpPolicy<Variant>, MoE::w8a16_policy_m_8>;
   using Tile = typename Policy::WGTile;
   using MMA = typename TiledMMAHelper<
       MMA_Atom<XE_DPAS_TT<8, float, cutlass::half_t>>,
@@ -53,8 +74,8 @@ void gemm(
   const auto mma = MMA{};
   constexpr int K = Gate ? 2816 : 352;
   constexpr int N = Gate ? 704 : 2816;
-  constexpr int D = Gate ? (Variant == 4 ? 704 : 352) : 2816;
-  constexpr int TN = Gate && Variant != 4 ? 32 : 64;
+  constexpr int D = Gate ? (Variant >= 4 ? 704 : 352) : 2816;
+  constexpr int TN = Gate && Variant < 4 ? 32 : 64;
   const int routes = ids.numel(), threads = size(mma);
   const auto* a = reinterpret_cast<const cutlass::half_t*>(input.data_ptr());
   const auto* b =
@@ -64,7 +85,8 @@ void gemm(
   auto* d = reinterpret_cast<cutlass::half_t*>(output.data_ptr());
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
-  syclex::properties props{syclex::sub_group_size<16>, intelex::grf_size<256>};
+  constexpr int GRF = Variant == 5 ? 128 : 256;
+  syclex::properties props{syclex::sub_group_size<16>, intelex::grf_size<GRF>};
   const sycl::range<3> local(1, 1, threads), groups(1, routes, D / TN);
   q.submit([&](sycl::handler& cgh) {
     cgh.parallel_for<RoutedGemm<Gate, Grouped, Variant>>(
@@ -101,7 +123,7 @@ void gemm(
           auto C = MoE::make_moe_tensor<cutlass::half_t, 'R'>(
               d + row_base * D, rows, D);
           const cutlass::half_t* bias = nullptr;
-          if constexpr (Gate && Variant != 4) {
+          if constexpr (Gate && Variant < 4) {
             MoE::xe_gemm_gate_up<
                 typename Policy::GmemTiledCopyA,
                 typename Policy::GmemTiledCopyB,
@@ -187,22 +209,26 @@ void launch(
     reverse = at::empty_like(ids);
     map_ptr = map.data_ptr<int>();
     reverse_ptr = reverse.data_ptr<int>();
-    q.parallel_for(
-        sycl::nd_range<1>((1 + m * 8) * 128, 128),
-        PrepareMap{
-            reinterpret_cast<const Half8*>(input.data_ptr()),
-            ids.data_ptr<int>(),
-            reinterpret_cast<Half8*>(packed.data_ptr()),
-            map_ptr,
-            reverse_ptr,
-            m * 8});
+    const PrepareMap prepare{
+        reinterpret_cast<const Half8*>(input.data_ptr()),
+        ids.data_ptr<int>(),
+        reinterpret_cast<Half8*>(packed.data_ptr()),
+        map_ptr,
+        reverse_ptr,
+        m * 8};
+    const sycl::nd_range<1> range((1 + m * 8) * 128, 128);
+    if constexpr (Variant == 5)
+      q.parallel_for(range, Register128<1, PrepareMap>{prepare});
+    else
+      q.parallel_for(range, prepare);
   }
-  if constexpr (Variant == 4) {
+  if constexpr (Variant >= 4) {
     auto gate_up = at::empty({m * 8, 704}, input.options());
     gemm<true, Grouped, Variant>(q, packed, w13, s13, ids, gate_up, map_ptr);
     const auto* in = reinterpret_cast<const Half4*>(gate_up.data_ptr());
     auto* out = reinterpret_cast<Half4*>(activation.data_ptr());
-    q.parallel_for<Activation<Variant>>(
+    submit_vector<Activation<Variant>, Variant == 5>(
+        q,
         sycl::nd_range<2>({size_t(m * 8), 96}, {1, 32}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
           const int row = it.get_group(0), col = it.get_global_id(1);
@@ -230,7 +256,8 @@ void launch(
   const auto* in = reinterpret_cast<const Half8*>(partial.data_ptr());
   const auto* w = weights.data_ptr<float>();
   auto* out = reinterpret_cast<Half8*>(output.data_ptr());
-  q.parallel_for<RoutedGather<Grouped, Variant>>(
+  submit_vector<RoutedGather<Grouped, Variant>, Variant == 5>(
+      q,
       sycl::nd_range<2>({size_t(m), 352}, {1, 32}),
       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
         const int row = it.get_group(0), col = it.get_global_id(1);
@@ -301,6 +328,8 @@ bool experts(
   // weight tiles can be reused; one prepare builds the map for both GEMMs.
   if (input.size(0) <= 4)
     launch<false, 0>(output, input, w13, s13, w2, s2, weights, ids);
+  else if (input.size(0) == 5)
+    launch<true, 5>(output, input, w13, s13, w2, s2, weights, ids);
   else
     launch<true, 4>(output, input, w13, s13, w2, s2, weights, ids);
   return true;
