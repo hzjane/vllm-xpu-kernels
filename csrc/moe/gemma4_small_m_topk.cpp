@@ -1,10 +1,12 @@
 #include "moe_ops.h"
+#include "core/registration.h"
 
 #include <ATen/DeviceGuard.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <limits>
 
 namespace {
 
@@ -36,11 +38,12 @@ struct Gemma4SmallMTopK {
     const int64_t ordered = sycl::bit_cast<int64_t>(
         (static_cast<uint64_t>(key) << 32) | static_cast<uint64_t>(expert));
     ordered_keys[expert] = ordered;
-    float maximum = sycl::reduce_over_group(
-        item.get_group(), value, sycl::maximum<float>());
-    if (sycl::any_of_group(item.get_group(), sycl::isnan(value))) {
-      maximum = sycl::bit_cast<float>(0x7fc00000u);
-    }
+    // Match Triton's maximum: NaN logits do not poison finite lanes.
+    // Preserve the original value for sorting and the selected exponential.
+    const float maximum = sycl::reduce_over_group(
+        item.get_group(),
+        sycl::isnan(value) ? -std::numeric_limits<float>::infinity() : value,
+        sycl::maximum<float>());
     item.barrier(sycl::access::fence_space::local_space);
 
     int rank = 0;
@@ -135,4 +138,20 @@ std::tuple<torch::Tensor, torch::Tensor> gemma4_small_m_topk(
     launch_topk<float>(logits, per_expert_scale, weights, ids);
   }
   return {weights, ids};
+}
+
+TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, m) {
+  m.impl(
+      "gemma4_small_m_topk",
+      [](const torch::Tensor& logits,
+         const std::optional<torch::Tensor>& per_expert_scale,
+         int64_t topk) {
+        return std::make_tuple(
+            at::empty_symint(
+                {logits.sym_size(0), c10::SymInt(topk)},
+                logits.options().dtype(at::kFloat)),
+            at::empty_symint(
+                {logits.sym_size(0), c10::SymInt(topk)},
+                logits.options().dtype(at::kInt)));
+      });
 }
