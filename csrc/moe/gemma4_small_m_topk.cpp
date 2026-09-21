@@ -1,10 +1,12 @@
 #include "moe_ops.h"
+#include "core/registration.h"
 
 #include <ATen/DeviceGuard.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <limits>
 
 namespace {
 
@@ -21,8 +23,8 @@ struct Gemma4SmallMTopK {
   sycl::local_accessor<int64_t, 1> ordered_keys;
   sycl::local_accessor<float, 1> selected_exp;
 
-  [[sycl::reqd_sub_group_size(16)]] void operator()(
-      sycl::nd_item<1> item) const {
+  [[sycl::reqd_sub_group_size(16)]] void
+  operator()(sycl::nd_item<1> item) const {
     const int expert = item.get_local_linear_id();
     const int token = item.get_group_linear_id();
     const float value = static_cast<float>(logits[token * kExperts + expert]);
@@ -36,11 +38,12 @@ struct Gemma4SmallMTopK {
     const int64_t ordered = sycl::bit_cast<int64_t>(
         (static_cast<uint64_t>(key) << 32) | static_cast<uint64_t>(expert));
     ordered_keys[expert] = ordered;
-    float maximum =
-        sycl::reduce_over_group(item.get_group(), value, sycl::maximum<float>());
-    if (sycl::any_of_group(item.get_group(), sycl::isnan(value))) {
-      maximum = sycl::bit_cast<float>(0x7fc00000u);
-    }
+    // Match Triton's maximum: NaN logits do not poison finite lanes.
+    // Preserve the original value for sorting and the selected exponential.
+    const float maximum = sycl::reduce_over_group(
+        item.get_group(),
+        sycl::isnan(value) ? -std::numeric_limits<float>::infinity() : value,
+        sycl::maximum<float>());
     item.barrier(sycl::access::fence_space::local_space);
 
     int rank = 0;
@@ -60,11 +63,12 @@ struct Gemma4SmallMTopK {
       }
       sum = sum > 0.0f ? sum : 1.0f;
       const float scale =
-          !expert_scales ? 1.0f
-                         : (scale_is_half
-                                ? static_cast<float>(
-                                      static_cast<const sycl::half*>(expert_scales)[expert])
-                                : static_cast<const float*>(expert_scales)[expert]);
+          !expert_scales
+              ? 1.0f
+              : (scale_is_half
+                     ? static_cast<float>(static_cast<const sycl::half*>(
+                           expert_scales)[expert])
+                     : static_cast<const float*>(expert_scales)[expert]);
       weights[token * kTopK + rank] = selected_exp[rank] * (1.0f / sum) * scale;
       ids[token * kTopK + rank] = expert;
     }
@@ -106,8 +110,8 @@ std::tuple<torch::Tensor, torch::Tensor> gemma4_small_m_topk(
       logits.is_xpu() && logits.dim() == 2 && logits.is_contiguous(),
       "gemma4_small_m_topk requires contiguous 2D XPU logits");
   TORCH_CHECK(
-      logits.size(0) >= 1 && logits.size(0) <= 8 && logits.size(1) == kExperts &&
-          topk == kTopK,
+      logits.size(0) >= 1 && logits.size(0) <= 8 &&
+          logits.size(1) == kExperts && topk == kTopK,
       "gemma4_small_m_topk supports M=1..8, E=128 and topk=8");
   TORCH_CHECK(
       logits.scalar_type() == at::kHalf || logits.scalar_type() == at::kFloat,
@@ -120,15 +124,34 @@ std::tuple<torch::Tensor, torch::Tensor> gemma4_small_m_topk(
             per_expert_scale->dim() == 1 &&
             per_expert_scale->numel() == kExperts &&
             per_expert_scale->is_contiguous(),
-        "per_expert_scale must be contiguous XPU FP16/FP32 [128] on the logits device");
+        "per_expert_scale must be contiguous XPU FP16/FP32 [128] on the logits "
+        "device");
   }
   const at::DeviceGuard guard(logits.device());
-  auto weights = at::empty({logits.size(0), topk}, logits.options().dtype(at::kFloat));
-  auto ids = at::empty({logits.size(0), topk}, logits.options().dtype(at::kInt));
+  auto weights =
+      at::empty({logits.size(0), topk}, logits.options().dtype(at::kFloat));
+  auto ids =
+      at::empty({logits.size(0), topk}, logits.options().dtype(at::kInt));
   if (logits.scalar_type() == at::kHalf) {
     launch_topk<sycl::half>(logits, per_expert_scale, weights, ids);
   } else {
     launch_topk<float>(logits, per_expert_scale, weights, ids);
   }
   return {weights, ids};
+}
+
+TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Meta, m) {
+  m.impl(
+      "gemma4_small_m_topk",
+      [](const torch::Tensor& logits,
+         const std::optional<torch::Tensor>& per_expert_scale,
+         int64_t topk) {
+        return std::make_tuple(
+            at::empty_symint(
+                {logits.sym_size(0), c10::SymInt(topk)},
+                logits.options().dtype(at::kFloat)),
+            at::empty_symint(
+                {logits.sym_size(0), c10::SymInt(topk)},
+                logits.options().dtype(at::kInt)));
+      });
 }
