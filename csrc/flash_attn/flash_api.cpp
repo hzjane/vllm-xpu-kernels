@@ -242,10 +242,12 @@ std::vector<at::Tensor> mha_varlen_fwd(
        (out.is_contiguous() && out.sizes() == q.sizes())) &&
       !splits_per_seq.has_value() && !work_list.has_value() &&
       max_seqlen_k >= 16384 && max_seqlen_k <= 40960 &&
-      ((q.size(2) == 256 && v.size(3) == 256 && k.size(1) == 32 &&
+      ((q.size(2) == 256 && v.size(3) == 256 &&
+        (k.size(1) == 32 || k.size(1) == 64) &&
         (q.size(1) == 8 || q.size(1) == 16) && q.size(1) == 2 * k.size(2) &&
         window_size_left == 1023 && window_size_right == 0) ||
-       (q.size(2) == 512 && v.size(3) == 512 && k.size(1) == 64 &&
+       (q.size(2) == 512 && v.size(3) == 512 &&
+        (k.size(1) == 64 || k.size(1) == 128) &&
         (q.size(1) == 8 || q.size(1) == 16) && q.size(1) == 8 * k.size(2) &&
         !is_local));
   if (small_m_decode) {
@@ -498,12 +500,13 @@ std::vector<at::Tensor> mha_varlen_fwd(
     const bool use_short_sequence_policy =
         vllm::xpu::is_xe2_arch() && q_type == at::kHalf &&
         k_type == at::kHalf && num_tokens == 1 && batch_size == 1 &&
-        max_seqlen_q == 1 && num_heads_q == 16 && block_size == 64 &&
-        !is_sink && !splits_per_seq.has_value() && !work_list.has_value() &&
+        max_seqlen_q == 1 && num_heads_q == 16 &&
+        (block_size == 64 || block_size == 128) && !is_sink &&
+        !splits_per_seq.has_value() && !work_list.has_value() &&
         ((!is_local && head_size_qk == 512 && v_head_dim == 512 &&
           num_heads_kv == 2) ||
-         (is_local && head_size_qk == 256 && v_head_dim == 256 &&
-          num_heads_kv == 8));
+         (is_local && block_size == 64 && head_size_qk == 256 &&
+          v_head_dim == 256 && num_heads_kv == 8));
     int num_kv_splits = num_splits.value_or(get_num_splits(
         queue,
         batch_size,
@@ -523,7 +526,7 @@ std::vector<at::Tensor> mha_varlen_fwd(
         q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf &&
         head_size_qk == 512 && v_head_dim == 512 && batch_size == 1 &&
         max_seqlen_q == 1 && num_heads_q == 16 && num_heads_kv == 2 &&
-        block_size == 64 && !is_local && !is_sink &&
+        (block_size == 64 || block_size == 128) && !is_local && !is_sink &&
         effective_seqlen_k >= 16384 && effective_seqlen_k <= 40960) {
       num_kv_splits = std::min(num_kv_splits, 16);
     }

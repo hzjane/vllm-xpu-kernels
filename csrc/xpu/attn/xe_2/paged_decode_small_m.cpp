@@ -39,8 +39,9 @@ bool try_paged_decode_small_m_xe2(
       value.scalar_type() != at::kHalf || query.dim() != 3 ||
       query.size(0) < 1 || query.size(0) > 8 ||
       (query.size(1) != 8 && query.size(1) != 16) || query.size(2) != 512 ||
-      key.dim() != 4 || key.size(1) != 64 || key.size(2) * 8 != query.size(1) ||
-      key.size(3) != 512 || value.sizes() != key.sizes() || max_seqlen_q != 1 ||
+      key.dim() != 4 || (key.size(1) != 64 && key.size(1) != 128) ||
+      key.size(2) * 8 != query.size(1) || key.size(3) != 512 ||
+      value.sizes() != key.sizes() || max_seqlen_q != 1 ||
       max_seqlen_k < 16384 || max_seqlen_k > 40960 ||
       (num_kv_splits != 8 && num_kv_splits != 16 && num_kv_splits != 32) ||
       query.stride(-1) != 1 || key.stride(-1) != 1 || value.stride(-1) != 1 ||
@@ -85,7 +86,8 @@ bool try_paged_decode_small_m_xe2(
   args.head_size = 512;
   args.v_head_size = 512;
   args.max_blocks_per_seq = block_table.size(1);
-  args.block_size = 64;
+  // The policy uses 64-token tiles; the physical cache page may be 128.
+  args.block_size = key.size(1);
   args.window_size_left = max_seqlen_k;
   args.window_size_right = max_seqlen_k;
   args.is_varlen = true;
