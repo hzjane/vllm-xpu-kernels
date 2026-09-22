@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Decode helpers: deterministic route packing, vector gather/GELU and
-// head-parallel RoPE.
+// Small-decode vector GELU and head-parallel RoPE.
 #include <ATen/ATen.h>
 #include <ATen/MemoryOverlap.h>
 #include <Python.h>
@@ -8,13 +7,9 @@
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
 #include <torch/library.h>
-#include <ATen/core/dispatch/Dispatcher.h>
 
 namespace vllm::decode_aux {
 namespace {
-struct alignas(16) Half8 {
-  sycl::half v[8];
-};
 struct alignas(8) Half4 {
   sycl::half v[4];
 };
@@ -29,160 +24,6 @@ void tensor(
 void separate(const at::Tensor& out, const at::Tensor& in) {
   at::assert_no_internal_overlap(out);
   at::assert_no_overlap(out, in);
-}
-
-struct Prepare {
-  const sycl::half* input;
-  const int* ids;
-  sycl::half* packed;
-  int* counts;
-  int* reverse;
-  int routes;
-  void operator()
-      [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<1> it) const {
-    const int group = it.get_group(0), lane = it.get_local_id(0);
-    if (group < 4) {
-      const int expert = group * 32 + lane;
-      int count = 0;
-      for (int j = 0; j < routes; ++j)
-        count += ids[j] == expert;
-      counts[expert] =
-          count;  // Overwrite every expert, including empty experts.
-      return;
-    }
-    const int route = group - 4, expert = ids[route];
-    if (expert < 0 || expert >= 128) {
-      if (lane == 0) reverse[route] = -1;
-      return;
-    }
-    int before = 0;
-    for (int j = lane; j < routes; j += 32) {
-      const int other = ids[j];
-      before += other >= 0 && other < 128 &&
-                (other < expert || (other == expert && j < route));
-    }
-    const int destination =
-        sycl::reduce_over_group(it.get_sub_group(), before, sycl::plus<int>());
-    if (lane == 0) reverse[route] = destination;
-    const auto* src =
-        reinterpret_cast<const Half8*>(input + (route / 8) * 2816);
-    auto* dst = reinterpret_cast<Half8*>(packed + destination * 2816);
-    for (int col = lane; col < 352; col += 32)
-      dst[col] = src[col];
-  }
-};
-
-void prepare(
-    at::Tensor packed,
-    at::Tensor counts,
-    at::Tensor reverse,
-    const at::Tensor& input,
-    const at::Tensor& ids) {
-  tensor(input, input, at::kHalf);
-  tensor(ids, input, at::kInt);
-  tensor(packed, input, at::kHalf);
-  tensor(counts, input, at::kInt);
-  tensor(reverse, input, at::kInt);
-  TORCH_CHECK(
-      input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 8 &&
-          input.size(1) == 2816,
-      "Expected input [M=1..8, 2816]");
-  const int m = input.size(0);
-  TORCH_CHECK(
-      ids.sizes() == at::IntArrayRef({m, 8}) &&
-          reverse.sizes() == ids.sizes() &&
-          packed.sizes() == at::IntArrayRef({m * 8, 2816}) &&
-          counts.sizes() == at::IntArrayRef({128}),
-      "Expected topk=8, E=128 and matching outputs");
-  for (const auto& out : {packed, counts, reverse}) {
-    separate(out, input);
-    separate(out, ids);
-  }
-  separate(packed, counts);
-  separate(packed, reverse);
-  separate(counts, reverse);
-  TORCH_CHECK(
-      reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
-          reinterpret_cast<uintptr_t>(packed.data_ptr()) % 16 == 0,
-      "Expected 16-byte aligned FP16 data");
-  const c10::DeviceGuard guard(input.device());
-  auto& q = c10::xpu::getCurrentXPUStream(input.get_device()).queue();
-  q.parallel_for(
-      sycl::nd_range<1>((4 + m * 8) * 32, 32),
-      Prepare{
-          reinterpret_cast<const sycl::half*>(input.data_ptr()),
-          ids.data_ptr<int>(),
-          reinterpret_cast<sycl::half*>(packed.data_ptr()),
-          counts.data_ptr<int>(),
-          reverse.data_ptr<int>(),
-          m * 8});
-}
-
-struct Gather {
-  const sycl::half* input;
-  const float* weights;
-  const int* reverse;
-  sycl::half* output;
-  int routes;
-  void operator()
-      [[sycl::reqd_sub_group_size(32)]] (sycl::nd_item<2> it) const {
-    const int row = it.get_group(0), col = it.get_global_id(1);
-    float accum[8] = {};
-#pragma unroll
-    for (int k = 0; k < 8; ++k) {
-      const int src = reverse[row * 8 + k];
-      if (src < 0 || src >= routes) continue;
-      const auto values =
-          reinterpret_cast<const Half8*>(input + src * 2816)[col];
-      const float weight = weights[row * 8 + k];
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        accum[i] += float(values.v[i]) * weight;
-    }
-    Half8 result;
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-      result.v[i] = sycl::half(accum[i]);
-    reinterpret_cast<Half8*>(output + row * 2816)[col] = result;
-  }
-};
-
-void gather(
-    at::Tensor output,
-    const at::Tensor& input,
-    const at::Tensor& weights,
-    const at::Tensor& reverse) {
-  tensor(output, input, at::kHalf);
-  tensor(input, input, at::kHalf);
-  tensor(weights, input, at::kFloat);
-  tensor(reverse, input, at::kInt);
-  TORCH_CHECK(
-      output.dim() == 2 && output.size(0) >= 1 && output.size(0) <= 8 &&
-          output.size(1) == 2816,
-      "Expected output [M=1..8,2816]");
-  const int m = output.size(0);
-  TORCH_CHECK(
-      input.sizes() == at::IntArrayRef({m * 8, 2816}) &&
-          weights.sizes() == at::IntArrayRef({m, 8}) &&
-          reverse.sizes() == weights.sizes(),
-      "Expected topk=8 and matching tensors");
-  separate(output, input);
-  separate(output, weights);
-  separate(output, reverse);
-  TORCH_CHECK(
-      reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
-          reinterpret_cast<uintptr_t>(output.data_ptr()) % 16 == 0,
-      "Expected 16-byte aligned FP16 data");
-  const c10::DeviceGuard guard(input.device());
-  auto& q = c10::xpu::getCurrentXPUStream(input.get_device()).queue();
-  q.parallel_for(
-      sycl::nd_range<2>({size_t(m), 352}, {1, 32}),
-      Gather{
-          reinterpret_cast<const sycl::half*>(input.data_ptr()),
-          weights.data_ptr<float>(),
-          reverse.data_ptr<int>(),
-          reinterpret_cast<sycl::half*>(output.data_ptr()),
-          m * 8});
 }
 
 struct Gelu {
@@ -346,95 +187,19 @@ bool try_rope(
   return true;
 }
 
-at::Tensor gelu_dispatch(const at::Tensor& x) {
-  auto shape = x.sizes().vec();
-  TORCH_CHECK(!shape.empty(), "GELU requires at least one dimension");
-  shape.back() /= 2;
-  auto out = at::empty(shape, x.options());
-  if (x.is_xpu() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
-      x.size(0) >= 1 && x.size(0) <= 64 &&
-      (x.size(1) == 704 || x.size(1) == 2112) && x.is_contiguous() &&
-      reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0) {
-    gelu(out, x);
-  } else {
-    using F = void(at::Tensor&, at::Tensor&);
-    static auto old = c10::Dispatcher::singleton()
-                          .findSchemaOrThrow("_C::gelu_tanh_and_mul", "")
-                          .typed<F>();
-    at::Tensor input = x;
-    old.call(out, input);
-  }
-  return out;
-}
-
-at::Tensor rms_dispatch(
-    const at::Tensor& x, const std::optional<at::Tensor>& weight, double eps) {
-  if (x.is_xpu() && x.scalar_type() == at::kHalf && x.dim() >= 2 &&
-      x.dim() <= 4 && x.size(0) >= 1 && x.size(0) <= 8 &&
-      (x.size(-1) == 256 || x.size(-1) == 512 || x.size(-1) == 2816 ||
-       x.size(-1) == 5376) &&
-      x.numel() / x.size(-1) >= 1 && x.numel() / x.size(-1) <= 128 &&
-      x.stride(-1) == 1 && eps >= 0 &&
-      (!weight || (weight->device() == x.device() &&
-                   weight->scalar_type() == at::kHalf && weight->dim() == 1 &&
-                   weight->numel() == x.size(-1) && weight->is_contiguous()))) {
-    using F =
-        at::Tensor(const at::Tensor&, const std::optional<at::Tensor>&, double);
-    static auto fast = c10::Dispatcher::singleton()
-                           .findSchemaOrThrow("_xpu_C::rms_norm_small_m", "")
-                           .typed<F>();
-    return fast.call(x, weight, eps);
-  }
-  auto out = at::empty(x.sizes(), x.options());
-  using F = void(at::Tensor&, at::Tensor&, std::optional<at::Tensor>, double);
-  static auto old = c10::Dispatcher::singleton()
-                        .findSchemaOrThrow("_C::rms_norm", "")
-                        .typed<F>();
-  at::Tensor input = x;
-  old.call(out, input, weight, eps);
-  return out;
-}
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_xpu_C, m) {
-  m.def("gelu_tanh_and_mul_decode(Tensor input) -> Tensor");
-  m.def(
-      "rms_norm_decode_dispatch(Tensor input, Tensor? weight, float epsilon) "
-      "-> Tensor");
   m.def(
       "try_rotary_embedding_small_m(Tensor positions, Tensor(a!) query, "
       "Tensor(b!) key, int head, Tensor cache) -> bool");
-  m.def(
-      "moe_prepare_small_m(Tensor(a!) packed, Tensor(b!) counts, Tensor(c!) "
-      "reverse, Tensor input, Tensor ids) -> ()");
-  m.def(
-      "moe_gather_small_m(Tensor(a!) output, Tensor input, Tensor weights, "
-      "Tensor reverse) -> ()");
   m.def("gelu_tanh_and_mul_small_m(Tensor(a!) output, Tensor input) -> ()");
-  m.def(
-      "rotary_embedding_small_m(Tensor positions, Tensor(a!) query, "
-      "Tensor(b!) key, int head, Tensor cache) -> ()");
 }
 TORCH_LIBRARY_IMPL(_xpu_C, XPU, m) {
-  m.impl("gelu_tanh_and_mul_decode", &gelu_dispatch);
-  m.impl("rms_norm_decode_dispatch", &rms_dispatch);
   m.impl("try_rotary_embedding_small_m", &try_rope);
-  m.impl("moe_prepare_small_m", &prepare);
-  m.impl("moe_gather_small_m", &gather);
   m.impl("gelu_tanh_and_mul_small_m", &gelu);
-  m.impl("rotary_embedding_small_m", &rope);
 }
 TORCH_LIBRARY_IMPL(_xpu_C, Meta, m) {
-  m.impl("gelu_tanh_and_mul_decode", [](const at::Tensor& x) {
-    auto s = x.sym_sizes().vec();
-    s.back() /= 2;
-    return at::empty_symint(s, x.options());
-  });
-  m.impl(
-      "rms_norm_decode_dispatch",
-      [](const at::Tensor& x, const std::optional<at::Tensor>&, double) {
-        return at::empty_symint(x.sym_sizes(), x.options());
-      });
   m.impl(
       "try_rotary_embedding_small_m",
       [](const at::Tensor&,
@@ -442,25 +207,7 @@ TORCH_LIBRARY_IMPL(_xpu_C, Meta, m) {
          at::Tensor,
          int64_t,
          const at::Tensor&) { return false; });
-  m.impl(
-      "moe_prepare_small_m",
-      [](at::Tensor,
-         at::Tensor,
-         at::Tensor,
-         const at::Tensor&,
-         const at::Tensor&) {});
-  m.impl(
-      "moe_gather_small_m",
-      [](at::Tensor, const at::Tensor&, const at::Tensor&, const at::Tensor&) {
-      });
   m.impl("gelu_tanh_and_mul_small_m", [](at::Tensor, const at::Tensor&) {});
-  m.impl(
-      "rotary_embedding_small_m",
-      [](const at::Tensor&,
-         at::Tensor,
-         at::Tensor,
-         int64_t,
-         const at::Tensor&) {});
 }
 }  // namespace vllm::decode_aux
 

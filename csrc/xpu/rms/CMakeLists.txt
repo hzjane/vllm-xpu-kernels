@@ -6,7 +6,6 @@ define_gpu_extension_target(
   LANGUAGE
   ${VLLM_GPU_LANG}
   SOURCES
-  "csrc/xpu/rms/weightless_rms.cpp"
   "csrc/xpu/rms/small_m_rms.cpp"
   COMPILE_FLAGS
   ${VLLM_GPU_COMPILE_FLAGS}

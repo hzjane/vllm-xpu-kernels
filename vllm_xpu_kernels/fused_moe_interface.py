@@ -4,12 +4,6 @@ from typing import Optional
 
 import torch
 
-from . import decode_aux
-from .moe_utils import (dequant_fp8_block_act, dequant_mxfp8, quant_act_xpu,
-                        ref_fused_moe)
-
-_FP8_MOE_DECODE = getattr(torch.ops._xpu_C, "fp8_moe_decode", None)
-
 try:
     from . import _C  # noqa: F401
     from . import _moe_C  # noqa: F401
@@ -20,7 +14,10 @@ except ImportError as e:
     FUSEDMOE_UNAVAILABLE_REASON = str(e)
     FUSEDMOE_AVAILABLE = False
 
+from .moe_utils import (dequant_fp8_block_act, dequant_mxfp8, quant_act_xpu,
+                        ref_fused_moe)
 
+_FP8_MOE_DECODE = getattr(torch.ops._xpu_C, "fp8_moe_decode", None)
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
@@ -392,24 +389,6 @@ class XpuFusedMoe:
         if expert_map is None and self.ep_size > 1:
             expert_map = self.expert_map
 
-        use_small_m_aux = (
-            decode_aux._PREPARE is not None
-            and decode_aux._GATHER is not None
-            and not act_quant and expert_map is None
-            and self.ep_size == 1 and self.num_experts == 128
-            and self.total_experts_num == 128
-            and self.n_experts_per_token == 8
-            and 1 <= num_rows <= 8 and hidden_size == 2816
-            and hidden_states.dtype == torch.float16
-            and hidden_states.is_contiguous()
-            and hidden_states.storage_offset() % 8 == 0
-            and topk_ids.dtype == torch.int32 and topk_ids.is_contiguous()
-            and topk_weights.dtype == torch.float32
-            and topk_weights.is_contiguous()
-            and output.dtype == torch.float16 and output.is_contiguous()
-            and output.storage_offset() % 8 == 0
-        )
-
         if act_quant:
             remapped_scales = torch.empty(
                 (num_rows * self.n_experts_per_token, a1q_scale.shape[1]),
@@ -421,29 +400,25 @@ class XpuFusedMoe:
             (num_rows * self.n_experts_per_token, hidden_size),
             dtype=hidden_states.dtype,
             device=hidden_states.device)
-        rows_per_expert = (torch.empty if use_small_m_aux else torch.zeros)(
-            (self.num_experts,), dtype=torch.int32, device=hidden_states.device)
+        rows_per_expert = torch.zeros((self.num_experts),
+                                                dtype=torch.int32,
+                                                device=hidden_states.device)
         unpermuted_row_to_permuted_row = torch.empty(
             (num_rows, self.n_experts_per_token),
             dtype=torch.int32,
             device=hidden_states.device)
 
-        if use_small_m_aux:
-            decode_aux._PREPARE(remapped_hidden_states, rows_per_expert,
-                                unpermuted_row_to_permuted_row,
-                                hidden_states, topk_ids)
-        else:
-            torch.ops._moe_C.remap_hidden_states(
-                hidden_states=hidden_states,
-                hidden_states_scales=a1q_scale,
-                remapped_hidden_states=remapped_hidden_states,
-                remapped_hidden_states_scales=remapped_scales,
-                expert_map=expert_map,
-                rows_per_expert=rows_per_expert,
-                unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
-                topk_ids=topk_ids,
-                total_experts_num=self.total_experts_num,
-                local_experts_num=self.local_experts_num)
+        torch.ops._moe_C.remap_hidden_states(
+            hidden_states=hidden_states,
+            hidden_states_scales=a1q_scale,
+            remapped_hidden_states=remapped_hidden_states,
+            remapped_hidden_states_scales=remapped_scales,
+            expert_map=expert_map,
+            rows_per_expert=rows_per_expert,
+            unpermuted_row_to_permuted_row=unpermuted_row_to_permuted_row,
+            topk_ids=topk_ids,
+            total_experts_num=self.total_experts_num,
+            local_experts_num=self.local_experts_num)
 
         # MXFP8 / block-FP8 activation scales: dequant to compute dtype so the
         # Xe2 grouped GEMM runs W8A16 / W16A16 (ptr_A_scale is accepted by the
@@ -495,8 +470,7 @@ class XpuFusedMoe:
                 if self.activation_situ_linear_beta is None
                 else self.activation_situ_linear_beta,
             )
-        elif not (self.activation == "gelu_tanh"
-                and decode_aux.gelu_tanh_and_mul(act_output, gemm1_output)):
+        else:
             self.act_func(act_output, gemm1_output)
 
         ########### gemm2 ##################
@@ -529,10 +503,6 @@ class XpuFusedMoe:
             K=self.inter_size * self.inter_size_scale,
             num_experts=self.num_experts)
 
-        if use_small_m_aux:
-            decode_aux._GATHER(output, gemm2_output, topk_weights,
-                               unpermuted_row_to_permuted_row)
-        else:
-            torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
-                                        unpermuted_row_to_permuted_row,
-                                        self.num_experts)
+        torch.ops._moe_C.moe_gather(output, gemm2_output, topk_weights,
+                                    unpermuted_row_to_permuted_row,
+                                    self.num_experts)

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "core/registration.h"
 #include <ATen/ATen.h>
 #include <ATen/MemoryOverlap.h>
 #include <c10/core/DeviceGuard.h>
@@ -248,3 +249,5 @@ TORCH_LIBRARY_FRAGMENT(_xpu_C, m) {
          const std::optional<at::Tensor>& weight,
          double epsilon) {});
 }
+
+REGISTER_EXTENSION(_rms_C)
