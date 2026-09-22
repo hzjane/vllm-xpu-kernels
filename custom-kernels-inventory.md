@@ -138,3 +138,24 @@ M=1、D=2816 的设备 kernel 中位耗时：
 - LM head 及其他输入走 `at::linear`；沿用已验证的未对齐 XPU 输入/权重对齐回退。原 `fp16_nt_gemm` 保留历史 Router/LM head 实验能力，算法不变。
 - vLLM `layers/utils.py` 提供薄 XPU 分派，旧包缺少新接口时直接 `F.linear`；不再依赖独立 `layers/xpu_linear.py`，不修改模型 forward、IR 注册或 CUDA/CPU 分派。
 - 本条源码与验证证据位于 `gemma_upstream_port_v2_20260917/linear_dispatch_review_20260918/`；不继承旧 TPOT 作为本次重测结果。
+
+## 2026-09-22：DiffusionGemma 批量 routing 与逐序列 attention
+
+- 新增 `_moe_C.gemma4_batch_topk(logits, per_expert_scale, topk)`：连续 XPU
+  FP16/FP32 logits `[M,128]`、`1 <= M <= 2048`、topk=8；可选同设备连续
+  FP16/FP32 expert scale `[128]`。返回 FP32 weights 与 int32 IDs `[M,8]`。
+  每个 subgroup 处理一个 token，在一个 SYCL kernel 中完成 top8、归一化与
+  expert scale，遵守当前 XPU stream；提供 Meta 实现。vLLM 的 XPU 分派
+  仅对 M9..2048 选择此入口，M1..8 保留 `gemma4_small_m_topk`。
+- `flash_attn_varlen_func` 与 `_vllm_fa2_C.varlen_fwd` 追加可选参数
+  `per_seq_causal=None`。Python 接受逐序列 XPU bool/int32，native 接受
+  连续 int32；未传入时保留原语义。Xe2/Xe3 支持混合 causal/双向序列及
+  对称 denoise 滑窗，无需将 mask 读回 host。Xe3P 分支对此参数显式报错。
+- 短 query 的 FP16 paged 快路采用滑窗 Q64、全局 Q128，仍各一个 kernel；
+  完整条件见 `KERNEL_CONFIGURATION.md`。测试扩展到实际 KV 步幅、scale=1、
+  window=1023，并保留 BF16、长短 KV、混合 mask 与非法输入覆盖。
+
+验证记录：attention 独立数学参考 289 项、routing 独立参考 163 项及与上游
+Triton 的 36 组对照通过；DiffusionGemma TP2 FP8/FP16 的 GSM8K 5 题通过，
+两个 rank 的服务 trace 均命中。5 题仅为基本验证，不表示大样本准确率等价。
+未采用的 MoE grouped GEMM/gather 候选不包含在本次实现中。
