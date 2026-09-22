@@ -71,6 +71,10 @@ option(FA2_KERNELS_ENABLED
        "Build Flash Attention 2 kernels (_vllm_fa2_C extension)" ON)
 option(MOE_KERNELS_ENABLED
        "Build MoE kernels (_moe_C extension + grouped_gemm TLA)" ON)
+option(DECODE_KERNELS_ENABLED
+       "Build small-M decode helpers (_decode_aux_C extension)" ON)
+option(FP16_LINEAR_KERNELS_ENABLED
+       "Build small-M FP16 Router (_fp16_C extension)" ON)
 option(GDN_KERNELS_ENABLED "Build GDN attention kernels (gdn_attn TLA)" ON)
 option(MQA_LOGITS_KERNELS_ENABLED "Build MQA logits kernels" ON)
 option(MHC_KERNELS_ENABLED
@@ -145,6 +149,7 @@ message(STATUS "  VLLM_XPU_ENABLE_XE_DEFAULT   = ${VLLM_XPU_ENABLE_XE_DEFAULT}")
 message(STATUS "  BASIC_KERNELS_ENABLED        = ${BASIC_KERNELS_ENABLED}")
 message(STATUS "  FA2_KERNELS_ENABLED          = ${FA2_KERNELS_ENABLED}")
 message(STATUS "  MOE_KERNELS_ENABLED          = ${MOE_KERNELS_ENABLED}")
+message(STATUS "  DECODE_KERNELS_ENABLED       = ${DECODE_KERNELS_ENABLED}")
 message(STATUS "  GDN_KERNELS_ENABLED          = ${GDN_KERNELS_ENABLED}")
 message(STATUS "  MQA_LOGITS_KERNELS_ENABLED   = ${MQA_LOGITS_KERNELS_ENABLED}")
 message(STATUS "  MHC_KERNELS_ENABLED          = ${MHC_KERNELS_ENABLED}")
@@ -672,6 +677,22 @@ endif()
 #
 # xpu only ops/kernels, implemented with cutlass/onednn/sycl.
 #
+if(FP16_LINEAR_KERNELS_ENABLED
+   AND BUILD_SYCL_TLA_KERNELS
+   AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/fp16_linear/CMakeLists.txt)
+endif()
+
+if(MOE_KERNELS_ENABLED
+   AND BUILD_SYCL_TLA_KERNELS
+   AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/moe_decode/CMakeLists.txt)
+endif()
+
+if(DECODE_KERNELS_ENABLED)
+  include(csrc/xpu/decode_aux/CMakeLists.txt)
+endif()
+
 if(XPU_SPECIFIC_KERNELS_ENABLED)
   message(STATUS "Enabling _xpu_C extension.")
 

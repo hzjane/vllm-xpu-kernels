@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import sys
+from importlib.util import find_spec
 from typing import Optional
 
 import torch
+
+# Architecture dispatch is also needed when attention is imported on its own.
+if find_spec(f"{__package__}._xpu_C") is not None:
+    from . import _xpu_C  # noqa: F401
 
 #isort: off
 try:
@@ -526,13 +531,33 @@ def flash_attn_varlen_func(
         # comment on _SPEC_DECODE_MAX_QLEN above for the rationale.
         batch = cu_seqlens_q.numel() - 1
         is_uniform_qlen = (batch > 0 and q.shape[0] == batch * max_seqlen_q)
+        # Gemma's measured single-sequence shapes build causal prefix metadata
+        # in one native kernel. Leave other uniform batches on the upstream
+        # Python expansion path; its generality is still needed there.
+        native_small_m = (
+            batch == 1 and 2 <= max_seqlen_q <= 8
+            and 16384 <= max_seqlen_k <= 40960
+            and q.dtype == k.dtype == v.dtype == torch.float16
+            and q.is_contiguous() and block_table is not None
+            and block_table.is_contiguous() and s_aux is None
+            and seqused_k is not None and seqused_k.is_contiguous()
+            and q.shape[1] in (8, 16)
+            and ((q.shape[2] == v.shape[-1] == 512
+                  and k.shape[1] in (64, 128) and q.shape[1] == 8 * k.shape[2]
+                  and real_window_size == (-1, -1))
+                 or (q.shape[2] == v.shape[-1] == 256
+                     and k.shape[1] in (32, 64) and q.shape[1] == 2 * k.shape[2]
+                     and real_window_size == (1023, 0)))
+            and hasattr(torch.ops._xpu_C, "is_xe2_arch")
+            and torch.ops._xpu_C.is_xe2_arch()
+        )
         # TODO: We could also support the case where q_descale is not None.
         if (block_table is not None and causal and not return_softmax_lse
                 and softcap == 0.0 and alibi_slopes is None and q_v is None
                 and q_descale is None and scheduler_metadata is None
                 and seqused_k is not None
                 and 1 < max_seqlen_q <= _SPEC_DECODE_MAX_QLEN
-                and is_uniform_qlen):
+                and is_uniform_qlen and not native_small_m):
             return _spec_decode_varlen_fwd(
                 q,
                 k,

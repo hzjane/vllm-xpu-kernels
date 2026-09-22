@@ -17,6 +17,8 @@ except ImportError as e:
 from .moe_utils import (dequant_fp8_block_act, dequant_mxfp8, quant_act_xpu,
                         ref_fused_moe)
 
+_FP8_MOE_DECODE = getattr(torch.ops._xpu_C, "fp8_moe_decode", None)
+
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
 # MXFP8 / block-FP8 use the native Xe2 path by default.
@@ -320,6 +322,20 @@ class XpuFusedMoe:
         expert_map=None,
         a1q_scale=None,
     ):
+        # This XPU experts boundary already owns remap, both GEMMs, activation
+        # and gather. The candidate keeps all three FP16 rounding boundaries.
+        if (_FP8_MOE_DECODE is not None and not self._use_ref and self.is_fp8
+                and self.activation == "gelu_tanh"
+                and self.w13_bias is None and self.w2_bias is None
+                and self.ep_size == 1 and self.ep_rank == 0
+                and self.expert_map is None and expert_map is None
+                and a1q_scale is None and self.gemm1_clamp_limit is None
+                and self.gemm1_wei_scales is not None
+                and self.gemm2_wei_scales is not None
+                and _FP8_MOE_DECODE(
+                    output, hidden_states, self.w13, self.gemm1_wei_scales,
+                    self.w2, self.gemm2_wei_scales, topk_weights, topk_ids)):
+            return
         if self._use_ref:
             self._apply_ref(output, hidden_states,
                             topk_weights, topk_ids,
