@@ -8,7 +8,7 @@ import vllm_xpu_kernels._C  # noqa: F401
 
 
 @pytest.mark.parametrize("num_heads", [1, 2, 8])
-@pytest.mark.parametrize("page_size", [64, 256])
+@pytest.mark.parametrize("page_size", [64, 128, 256])
 @pytest.mark.parametrize(
     "num_tokens,dtype,offset",
     [(1, torch.float16, 0), (8, torch.float16, 1),

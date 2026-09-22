@@ -677,8 +677,10 @@ void gelu_tanh_and_mul(
   static auto fast = vllm::decode::optional_operator<Fast>(
       "_xpu_C::gelu_tanh_and_mul_small_m");
   if (fast && input.is_xpu() && input.scalar_type() == at::kHalf &&
-      input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 64 &&
-      (input.size(1) == 704 || input.size(1) == 2112) &&
+      input.dim() == 2 &&
+      ((input.size(1) == 2112 && input.size(0) >= 1 && input.size(0) <= 8) ||
+       (input.size(1) == 704 && input.size(0) >= 8 && input.size(0) <= 64 &&
+        input.size(0) % 8 == 0)) &&
       input.is_contiguous() && out.device() == input.device() &&
       out.scalar_type() == at::kHalf && out.dim() == 2 &&
       out.size(0) == input.size(0) && out.size(1) * 2 == input.size(1) &&

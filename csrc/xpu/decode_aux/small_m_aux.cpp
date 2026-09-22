@@ -64,10 +64,13 @@ void gelu(at::Tensor output, const at::Tensor& input) {
   TORCH_CHECK(
       input.dim() == 2 && output.dim() == 2 &&
           input.size(0) == output.size(0) &&
-          input.size(1) == 2 * output.size(1) && input.size(0) >= 1 &&
-          input.size(0) <= 64 &&
-          (output.size(1) == 352 || output.size(1) == 1056),
-      "Expected FP16 GELU [1..64, 2*(352|1056)]");
+          input.size(1) == 2 * output.size(1) &&
+          ((output.size(1) == 1056 && input.size(0) >= 1 &&
+            input.size(0) <= 8) ||
+           (output.size(1) == 352 && input.size(0) >= 8 &&
+            input.size(0) <= 64 && input.size(0) % 8 == 0)),
+      "Expected Gemma TP2 FP16 GELU: shared MLP [M, 2112] or "
+      "routed experts [8*M, 704], M=1..8");
   separate(output, input);
   TORCH_CHECK(
       reinterpret_cast<uintptr_t>(input.data_ptr()) % 8 == 0 &&
@@ -183,6 +186,20 @@ bool try_rope(
       cache.dim() != 2 || cache.size(1) <= 0 || cache.size(1) > head ||
       cache.size(1) % 64 || query.data_ptr() == key.data_ptr())
     return false;
+  // Gemma4 TP2 local/global heads and rotary dimensions. Other models
+  // with exactly these tensors may share this specialization. Gemma's
+  // proportional RoPE pads the non-rotating channels in a full-width cache.
+  const int qheads = query.size(1) / head, kheads = key.size(1) / head;
+  const bool gemma_shape =
+      (head == 256 && cache.size(1) == 256 &&
+       ((qheads == 8 && kheads == 4) || (qheads == 16 && kheads == 8))) ||
+      (head == 512 && cache.size(1) == 512 &&
+       ((qheads == 8 && kheads == 1) || (qheads == 16 && kheads == 2)));
+  const int64_t qkv_width = query.size(1) + 2 * key.size(1);
+  const bool gemma_layout =
+      (query.stride(0) == query.size(1) || query.stride(0) == qkv_width) &&
+      (key.stride(0) == key.size(1) || key.stride(0) == qkv_width);
+  if (!gemma_shape || !gemma_layout) return false;
   rope(positions, query, key, head, cache);
   return true;
 }

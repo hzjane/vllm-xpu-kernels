@@ -949,6 +949,7 @@ void reshape_and_cache(
       block,                                                                 \
       num_tokens > 0 && num_tokens <= 8 && head_size == 512 &&               \
           num_heads == 2 && key.scalar_type() == at::kHalf &&                \
+          (block_size == 64 || block_size == 128) &&                         \
           KV_DTYPE == vllm::Fp8KVCacheDataType::kAuto,                       \
       vllm::reshape_and_cache_flash_strided_kernel<KV_T, CACHE_T, KV_DTYPE>( \
           reinterpret_cast<KV_T*>(key.data_ptr()),                           \
