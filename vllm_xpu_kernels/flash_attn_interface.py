@@ -458,7 +458,6 @@ def flash_attn_varlen_func(
     num_splits_kv: Optional[int] = None,
     is_mix_batch: bool = True,
     host_kv_lens: Optional[torch.Tensor] = None,
-    per_seq_causal: Optional[torch.Tensor] = None,
 ):
     """
     FlashAttention interface for variable-length sequences, with optional
@@ -497,16 +496,6 @@ def flash_attn_varlen_func(
         "when enable block_table, seqused_k is needed"
     assert block_table is not None or cu_seqlens_k is not None, \
         "when block_table is disabled, cu_seqlens_k is needed"
-
-    if per_seq_causal is not None:
-        if (per_seq_causal.device != q.device
-                or per_seq_causal.dtype not in (torch.bool, torch.int32)
-                or per_seq_causal.ndim != 1
-                or per_seq_causal.numel() != cu_seqlens_q.numel() - 1):
-            raise ValueError(
-                "per_seq_causal requires one XPU bool/int32 value per sequence")
-        per_seq_causal = per_seq_causal.to(torch.int32).contiguous()
-        causal = True
 
     if softmax_scale is None:
         softmax_scale = q.shape[-1]**(-0.5)
@@ -563,8 +552,7 @@ def flash_attn_varlen_func(
             and torch.ops._xpu_C.is_xe2_arch()
         )
         # TODO: We could also support the case where q_descale is not None.
-        if (per_seq_causal is None and block_table is not None and causal
-                and not return_softmax_lse
+        if (block_table is not None and causal and not return_softmax_lse
                 and softcap == 0.0 and alibi_slopes is None and q_v is None
                 and q_descale is None and scheduler_metadata is None
                 and seqused_k is not None
@@ -653,10 +641,9 @@ def flash_attn_varlen_func(
                 is_mix_batch,
                 splits_per_seq_dev,
                 work_list_dev,
-                per_seq_causal,
             )
         except RuntimeError as e:
-            if per_seq_causal is not None or "not compiled" not in str(e):
+            if "not compiled" not in str(e):
                 raise
             # Fallback to PyTorch reference implementation.
             # Emit the notice once per unique missing config and write

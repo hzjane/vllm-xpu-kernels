@@ -188,17 +188,6 @@ void dispatch(
 
 }  // namespace
 
-at::Tensor rms_norm_small_m(
-    const at::Tensor& input,
-    const std::optional<at::Tensor>& weight,
-    double epsilon) {
-  check(input, weight, epsilon);
-  const c10::DeviceGuard guard(input.device());
-  auto output = at::empty(input.sizes(), input.options());
-  dispatch(output, input, weight, epsilon);
-  return output;
-}
-
 void rms_norm_small_m_out(
     at::Tensor output,
     const at::Tensor& input,
@@ -220,27 +209,12 @@ void rms_norm_small_m_out(
 
 TORCH_LIBRARY_FRAGMENT(_xpu_C, m) {
   m.def(
-      "rms_norm_small_m(Tensor input, Tensor? weight, float epsilon) -> "
-      "Tensor");
-  m.def(
       "rms_norm_small_m.out(Tensor(a!) output, Tensor input, Tensor? weight, "
       "float epsilon) -> ()");
-  m.impl(
-      "rms_norm_small_m",
-      c10::DispatchKey::XPU,
-      &vllm::small_m_rms::rms_norm_small_m);
   m.impl(
       "rms_norm_small_m.out",
       c10::DispatchKey::XPU,
       &vllm::small_m_rms::rms_norm_small_m_out);
-  m.impl(
-      "rms_norm_small_m",
-      c10::DispatchKey::Meta,
-      [](const at::Tensor& input,
-         const std::optional<at::Tensor>& weight,
-         double epsilon) {
-        return at::empty_symint(input.sym_sizes(), input.options());
-      });
   m.impl(
       "rms_norm_small_m.out",
       c10::DispatchKey::Meta,

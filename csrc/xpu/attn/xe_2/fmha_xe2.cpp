@@ -10,31 +10,6 @@
 namespace vllm::xpu::xe2 {
 using namespace cute;
 
-// A 256-row tile exposes only one workgroup per query head for a diffusion
-// canvas. Keep eight query rows per subgroup and expose more workgroups.
-// Global attention uses a larger tile to avoid excessive cold-KV rereads.
-// QK/PV math, masking and cache strides are unchanged.
-template <int QueryTile, bool Local>
-static void
-launch_short_paged_fp16(sycl::queue& queue, const chunk_prefill_args_t& args) {
-  FMHAConfig<
-      Shape<Int<QueryTile>, _32, _32>,
-      Shape<Int<QueryTile>, _32, _32>,
-      Shape<Int<QueryTile>, _256>,
-      Layout<Shape<Int<QueryTile / 8>, _1, _1>>,
-      void,
-      2,
-      true,
-      !Local,
-      Local,
-      false,
-      false,
-      half_t,
-      half_t,
-      half_t,
-      half_t>::kernel_dispatch(queue, args);
-}
-
 void cutlass_chunk_prefill_xe2(
     sycl::queue& queue,
     const at::Tensor& query,      // [seq_q, heads, head_size]
@@ -58,8 +33,7 @@ void cutlass_chunk_prefill_xe2(
     bool is_local,
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
-    std::optional<const at::Tensor>& is_prefill,
-    std::optional<const at::Tensor>& per_seq_causal) {
+    std::optional<const at::Tensor>& is_prefill) {
   cutlass_chunk_prefill_impl(
       queue,
       query,
@@ -83,8 +57,7 @@ void cutlass_chunk_prefill_xe2(
       is_local,
       is_sink,
       softmax_lse,
-      is_prefill,
-      per_seq_causal);
+      is_prefill);
 }
 
 void cutlass_chunk_prefill_impl(
@@ -110,8 +83,7 @@ void cutlass_chunk_prefill_impl(
     bool is_local,
     bool is_sink,
     std::optional<at::Tensor>& softmax_lse,
-    std::optional<const at::Tensor>& is_prefill,
-    std::optional<const at::Tensor>& per_seq_causal) {
+    std::optional<const at::Tensor>& is_prefill) {
   // general params
   int batch_size, num_heads_q, num_heads_kv, head_size;
   // additional params
@@ -197,9 +169,6 @@ void cutlass_chunk_prefill_impl(
   // Per-batch prefill/decode mask (nullptr -> process all batches)
   args.is_prefill =
       is_prefill.has_value() ? is_prefill.value().data_ptr() : nullptr;
-  args.per_seq_causal = per_seq_causal.has_value()
-                            ? per_seq_causal->data_ptr<int32_t>()
-                            : nullptr;
   // Extract Q, K, V, O strides from tensors
   if (is_varlen) {
     // Q/O: [total_seq, num_heads, head_size]
@@ -292,26 +261,6 @@ void cutlass_chunk_prefill_impl(
         "chunk_prefill: unsupported block_size=",
         block_size,
         " (supported: any positive multiple of 16)");
-  }
-
-  // This FP16 per-sequence-mask path covers short, low-concurrency canvases.
-  // Preserve the generated-policy fallback for AR, encoder, other dtypes,
-  // page formats, sinks and LSE.
-  if (is_paged && is_varlen && per_seq_causal.has_value() &&
-      query.scalar_type() == at::kHalf &&
-      key_cache.scalar_type() == at::kHalf &&
-      value_cache.scalar_type() == at::kHalf && max_seqlen_q > 128 &&
-      max_seqlen_q <= 256 && batch_size * num_heads_q <= 16 &&
-      (head_size == 256 || head_size == 512) && !is_sink && !is_lse &&
-      (block_size == 32 || block_size % 64 == 0)) {
-    if (is_local && !is_causal) {
-      launch_short_paged_fp16<64, true>(queue, args);
-      return;
-    }
-    if (!is_local && is_causal) {
-      launch_short_paged_fp16<128, false>(queue, args);
-      return;
-    }
   }
 
   // Policy selection preserves the original routing for the previously
