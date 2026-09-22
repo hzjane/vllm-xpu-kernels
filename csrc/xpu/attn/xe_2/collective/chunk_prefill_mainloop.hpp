@@ -281,8 +281,7 @@ struct FMHAFwdMainloop<
       int seq_len,
       int full_tile_offset,
       int blk_local_l_safe,
-      int blk_local_r_safe,
-      int effective_right) {
+      int blk_local_r_safe) {
     using namespace sycl::ext::oneapi::this_work_item;
 
     // Short dimension names:
@@ -644,7 +643,7 @@ struct FMHAFwdMainloop<
             int row_idx = get<0>(cS_thread(i));
             int col_idx = get<1>(cS_thread(i)) - full_tile_offset;
             bool left_mask = col_idx < row_idx - params.local_left;
-            bool right_mask = col_idx > row_idx + effective_right;
+            bool right_mask = col_idx > row_idx + params.local_right;
             if (left_mask || right_mask) {
               tSrS(i) = ElementS(-INFINITY);
             }

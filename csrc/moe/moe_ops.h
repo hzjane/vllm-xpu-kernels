@@ -2,11 +2,6 @@
 
 #include <torch/all.h>
 
-std::tuple<torch::Tensor, torch::Tensor> gemma4_batch_topk(
-    const torch::Tensor& logits,
-    const std::optional<torch::Tensor>& per_expert_scale,
-    int64_t topk);
-
 std::tuple<torch::Tensor, torch::Tensor> gemma4_small_m_topk(
     const torch::Tensor& logits,
     const std::optional<torch::Tensor>& per_expert_scale,

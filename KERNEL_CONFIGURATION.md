@@ -87,19 +87,6 @@ Config files are located in `csrc/xpu/attn/kernel_configs/`.
 | `chunk_prefill_full.conf` | 240 | All combinations — supports every model |
 | `chunk_prefill_default.conf` | 70 | Llama, Qwen, DeepSeek MLA, Falcon, Gemma, Phi, GLM (default build) |
 
-### DiffusionGemma 的逐序列 attention
-
-Xe2/Xe3 路径支持可选 `per_seq_causal`，在同一批中区分 encoder causal
-与 denoise 双向 attention；双向滑窗使用左右对称窗口。默认 chunk-prefill
-预设增加 `256,true,true,true,false,false`，此模式始终使用 chunk-prefill，
-不会进入仅适用于自回归的小 M paged-decode 快路。
-
-对于带逐序列 mask 的 FP16 paged attention，`128 < max_seqlen_q <= 256`、
-`batch * num_heads_q <= 16`、head size 256/512、无 sink/LSE 且 page size
-为 32 或 64 的正整数倍时，滑窗使用 Q64/8 subgroups，全局使用
-Q128/16 subgroups；其余输入继续既有策略。每个 subgroup 仍处理 8 个 query。
-这些短 query 策略不改变 preset 格式，也不改变没有逐序列 mask 的调用。
-
 ### Paged Decode
 
 | File | Kernels | Use Case |

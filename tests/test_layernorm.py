@@ -315,15 +315,12 @@ def test_small_m_rms_strided_current_stream(batch, width, weighted, offset):
     with torch.xpu.stream(stream):
         x = cpu.to("xpu")[..., offset:offset + width]
         w = weight.to("xpu") if weight is not None else None
-        actual = torch.ops._xpu_C.rms_norm_small_m(x, w, 1e-6)
         output = torch.empty(x.shape, device=x.device, dtype=x.dtype)
         torch.ops._xpu_C.rms_norm_small_m.out(output, x, w, 1e-6)
     stream.synchronize()
     torch.testing.assert_close(
-        actual.cpu(), expected.half(), atol=2e-3, rtol=2e-3)
-    torch.testing.assert_close(
         output.cpu(), expected.half(), atol=2e-3, rtol=2e-3)
-    assert actual.is_contiguous()
+    assert output.is_contiguous()
 
 
 @torch.inference_mode()

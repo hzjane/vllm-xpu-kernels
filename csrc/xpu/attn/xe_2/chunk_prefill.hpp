@@ -92,7 +92,6 @@ struct chunk_prefill_args_t {
   // per-batch mask: true = prefill, false = decode; nullptr = process all
   void* is_prefill = nullptr;
   int page_stride_elements = 0;
-  const int32_t* per_seq_causal = nullptr;
 };
 
 template <class FMHAKernel, bool isVarLen>
@@ -193,8 +192,7 @@ struct KernelLauncher {
          reinterpret_cast<ElementQ*>(args.sm_sink),
          args.softmax_lse,
          args.lse_stride,
-         static_cast<const bool*>(args.is_prefill),
-         args.per_seq_causal},
+         static_cast<const bool*>(args.is_prefill)},
         {args.sm_scale,
          args.k_scale,
          args.v_scale,
