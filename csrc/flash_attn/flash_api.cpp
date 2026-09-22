@@ -134,7 +134,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
     std::optional<int> num_splits,
     bool mix_batch,
     std::optional<at::Tensor>& splits_per_seq,
-    std::optional<at::Tensor>& work_list) {
+    std::optional<at::Tensor>& work_list,
+    std::optional<const at::Tensor>& per_seq_causal) {
   auto q_type = q.scalar_type();
   auto k_type = k.scalar_type();
   bool q_is_fp8 = q_type == at::ScalarType::Float8_e5m2 ||
@@ -196,6 +197,15 @@ std::vector<at::Tensor> mha_varlen_fwd(
       cu_seqlens_k.dtype() == torch::kInt32,
       "cu_seqlens_k must have dtype torch.int32");
 
+  if (per_seq_causal.has_value()) {
+    TORCH_CHECK(
+        per_seq_causal->device() == q.device() &&
+            per_seq_causal->scalar_type() == at::kInt &&
+            per_seq_causal->dim() == 1 && per_seq_causal->is_contiguous() &&
+            per_seq_causal->numel() == cu_seqlens_q.numel() - 1,
+        "per_seq_causal requires one contiguous XPU int32 value per sequence");
+    TORCH_CHECK(is_causal, "per_seq_causal requires causal=true");
+  }
   auto& queue = vllm::xpu::vllmGetQueue(q.device().index());
 
   at::Tensor out;
@@ -224,17 +234,18 @@ std::vector<at::Tensor> mha_varlen_fwd(
   }
 
   at::Tensor seqlens_k = is_paged ? *seqused_k : cu_seqlens_k;
-  bool is_prefill_only = (!mix_batch && max_seqlen_q > 1) | !is_paged;
+  bool is_prefill_only = per_seq_causal.has_value() ||
+                         (!mix_batch && max_seqlen_q > 1) || !is_paged;
 
   // Small-M causal verification is a batch of single-query decodes against
   // progressively longer KV prefixes. Build the metadata on the current
   // stream: no host readback, cache copy, or change to vLLM is required.
   const bool small_m_decode =
-      vllm::xpu::is_xe2_arch() && is_paged && is_causal && !is_sink &&
-      !return_softmax && !q_scale.has_value() && p_dropout == 0.0 &&
-      max_seqlen_q >= 2 && max_seqlen_q <= 8 && q.size(0) == max_seqlen_q &&
-      cu_seqlens_q.numel() == 2 && seqlens_k.numel() == 1 &&
-      q_type == at::kHalf && k_type == at::kHalf &&
+      !per_seq_causal.has_value() && vllm::xpu::is_xe2_arch() && is_paged &&
+      is_causal && !is_sink && !return_softmax && !q_scale.has_value() &&
+      p_dropout == 0.0 && max_seqlen_q >= 2 && max_seqlen_q <= 8 &&
+      q.size(0) == max_seqlen_q && cu_seqlens_q.numel() == 2 &&
+      seqlens_k.numel() == 1 && q_type == at::kHalf && k_type == at::kHalf &&
       v.scalar_type() == at::kHalf && q.is_contiguous() &&
       seqlens_k.is_contiguous() && block_table.is_contiguous() &&
       block_table.size(0) == 1 && block_table.size(1) > 0 &&
@@ -373,7 +384,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_local,
         is_sink,
         softmax_lse_opt,
-        no_mask);
+        no_mask,
+        per_seq_causal);
   } else if (max_seqlen_q > 1) {
     if (!out_.has_value()) {
       // For fp8 query the output cannot be fp8; default to fp16 (matches the
@@ -411,7 +423,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         is_local,
         is_sink,
         softmax_lse_opt,
-        is_prefill_opt);
+        is_prefill_opt,
+        per_seq_causal);
 
     // Paged decode: processes only decode batches (skips prefill)
     int eff_window_left =
@@ -622,7 +635,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_causal, int window_size_left, int window_size_right, float "
       "softcap, bool return_softmax, "
       "Generator? gen, int? num_splits, bool mix_batch, Tensor? "
-      "splits_per_seq, Tensor? work_list) -> Tensor[]");
+      "splits_per_seq, Tensor? work_list, Tensor? per_seq_causal=None) -> "
+      "Tensor[]");
   ops.impl(
       "varlen_fwd",
       torch::kXPU,
