@@ -73,7 +73,6 @@ option(MOE_KERNELS_ENABLED
        "Build MoE kernels (_moe_C extension + grouped_gemm TLA)" ON)
 option(DECODE_KERNELS_ENABLED
        "Build small-M decode helpers (_decode_aux_C extension)" ON)
-option(RMS_KERNELS_ENABLED "Build small-M RMSNorm (_rms_C extension)" ON)
 option(FP16_LINEAR_KERNELS_ENABLED
        "Build small-M FP16 Router (_fp16_C extension)" ON)
 option(GDN_KERNELS_ENABLED "Build GDN attention kernels (gdn_attn TLA)" ON)
@@ -682,10 +681,6 @@ if(FP16_LINEAR_KERNELS_ENABLED
    AND BUILD_SYCL_TLA_KERNELS
    AND VLLM_XPU_ENABLE_XE2)
   include(csrc/xpu/fp16_linear/CMakeLists.txt)
-endif()
-
-if(RMS_KERNELS_ENABLED)
-  include(csrc/xpu/rms/CMakeLists.txt)
 endif()
 
 if(MOE_KERNELS_ENABLED

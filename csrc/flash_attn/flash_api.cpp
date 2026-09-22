@@ -510,7 +510,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
         ((!is_local && head_size_qk == 512 && v_head_dim == 512 &&
           num_heads_kv == 2) ||
          (is_local && block_size == 64 && head_size_qk == 256 &&
-          v_head_dim == 256 && num_heads_kv == 8));
+          v_head_dim == 256 && num_heads_kv == 8 && window_size_left == 1023 &&
+          window_size_right == 0));
     int num_kv_splits = num_splits.value_or(get_num_splits(
         queue,
         batch_size,
