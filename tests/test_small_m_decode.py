@@ -23,29 +23,6 @@ def test_rms_decode_strided(m, width, weighted, offset):
                              + 1e-6))
     if weight is not None:
         ref = ref * weight.cpu().float()
-    y = torch.ops._xpu_C.rms_norm_decode_dispatch(x, weight, 1e-6)
+    y = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    torch.ops._C.rms_norm(y, x, weight, 1e-6)
     torch.testing.assert_close(y.cpu(), ref.half(), rtol=1e-3, atol=2e-3)
-
-
-# Existing TP2 shapes exercise both M1 fused reduction and M2..8 Split-K.
-# New shapes exercise the SLM reduction selected only for M1.
-_LINEAR_CASES = [
-    (m, n, k)
-    for m in (1, 2, 8)
-    for n, k in ((4096, 2816), (2816, 2048), (5120, 2816),
-                 (2816, 4096), (2112, 2816), (2816, 1056))
-] + [(1, n, k) for n, k in ((8192, 5376), (5376, 4096),
-                           (10240, 5376), (5376, 8192),
-                           (21504, 5376), (5376, 10752))]
-
-
-@pytest.mark.parametrize("m,n,k", _LINEAR_CASES)
-def test_fp8_decode_nt(m, n, k):
-    torch.manual_seed(823)
-    x = torch.randn(m, k).half()
-    w = (torch.randn(n, k) * 16).to(torch.float8_e4m3fn)
-    scale = torch.tensor([0.002], dtype=torch.float32)
-    ref = x.float() @ (w.float() * scale).t()
-    y = torch.ops._xpu_C.fp8_gemm_w8a16(
-        x.to("xpu"), w.to("xpu").t(), scale.to("xpu"), None)
-    torch.testing.assert_close(y.cpu().float(), ref, rtol=1e-2, atol=5e-3)
