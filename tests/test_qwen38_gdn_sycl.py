@@ -263,6 +263,38 @@ def test_spec_v2_golden(gdn_ops, h, hv, m, packed):
         )
 
 
+@pytest.mark.parametrize("spec", (False, True))
+@pytest.mark.parametrize("separate_storage", (False, True))
+def test_shared_kv_pages_disjoint_conv_and_ssm(gdn_ops, spec, separate_storage):
+    cpu = _case(4, 12, 4 if spec else 2, spec=spec, packed=spec)
+    expected = _reference(cpu, spec=spec)
+    gpu = _xpu(cpu)
+    rows = gpu["conv"].shape[0]
+    conv_width = gpu["conv"][0].numel()
+    ssm_width = gpu["ssm"][0].numel()
+    backing = torch.full((rows, conv_width + ssm_width + 8), -19,
+                         dtype=torch.float16, device="xpu")
+    gpu["conv"] = backing[:, :conv_width].view_as(gpu["conv"])
+    gpu["ssm"] = backing[:, conv_width:conv_width + ssm_width].view_as(gpu["ssm"])
+    if separate_storage:
+        gpu["conv"] = torch.from_dlpack(gpu["conv"])
+        gpu["ssm"] = torch.from_dlpack(gpu["ssm"])
+        assert not torch._C._overlaps(gpu["conv"], gpu["ssm"])
+    gpu["conv"].copy_(cpu["conv"])
+    gpu["ssm"].copy_(cpu["ssm"])
+    common = [gpu[name] for name in (
+        "qkvz", "conv", "weight", "bias", "idx", "a_log", "dt_bias", "ba",
+        "ssm")]
+    if spec:
+        gdn_ops.spec_v2(*common, gpu["output"], gpu["z"], gpu["token_idx"],
+                        gpu["accepted"], 1, 4, gpu["scale"])
+    else:
+        gdn_ops.decode(*common, gpu["idx"], gpu["output"], gpu["z"], gpu["scale"])
+    for key, want in zip(("output", "z", "conv", "ssm"), expected):
+        torch.testing.assert_close(gpu[key].cpu(), want, atol=0.008, rtol=0.008)
+    assert torch.all(backing[:, -8:] == -19).item()
+
+
 def test_spec_null_block_outputs_zero(gdn_ops):
     case = _case(4, 12, 4, spec=True)
     case["idx"][0] = 0

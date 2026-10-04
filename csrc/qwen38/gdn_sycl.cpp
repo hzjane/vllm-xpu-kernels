@@ -60,22 +60,70 @@ void check_indices(
       " entries");
 }
 
+struct MemoryRows {
+  uintptr_t begin, end, width, pitch;
+  int64_t rows;
+};
+
+MemoryRows memory_rows(const torch::Tensor& t) {
+  const auto begin = reinterpret_cast<uintptr_t>(t.const_data_ptr());
+  if (t.numel() == 0) return {begin, begin, 0, 0, 0};
+  const auto item = uintptr_t(t.element_size());
+  if (t.is_contiguous())
+    return {begin, begin + uintptr_t(t.numel()) * item,
+            uintptr_t(t.numel()) * item, uintptr_t(t.numel()) * item, 1};
+  // Every accepted non-dense GDN layout has a dense inner row. Conv and SSM
+  // live in disjoint regions of each shared KV page, not distinct storages.
+  int64_t inner = 1;
+  for (int d = int(t.dim()) - 1; d >= 1; --d) {
+    TORCH_CHECK(t.size(d) == 1 || t.stride(d) == inner,
+                "GDN alias check requires dense inner rows");
+    inner *= t.size(d);
+  }
+  TORCH_CHECK(t.stride(0) >= inner, "GDN alias check requires positive pitch");
+  const auto width = uintptr_t(inner) * item;
+  const auto pitch = uintptr_t(t.stride(0)) * item;
+  const auto rows = t.size(0);
+  constexpr auto max = std::numeric_limits<uintptr_t>::max();
+  TORCH_CHECK(uintptr_t(rows - 1) <= (max - width) / pitch,
+              "GDN address span overflows");
+  const auto span = uintptr_t(rows - 1) * pitch + width;
+  TORCH_CHECK(begin <= max - span, "GDN address range overflows");
+  return {begin, begin + span, width, pitch, rows};
+}
+
+bool physical_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  auto left = memory_rows(a), right = memory_rows(b);
+  if (left.rows == 0 || right.rows == 0 || left.end <= right.begin ||
+      right.end <= left.begin) return false;
+  if (left.pitch == right.pitch) {
+    // Common KV-page pitch: decide by offset/width in O(1), not by iterating
+    // thousands of cache pages on every decode token.
+    if (left.begin > right.begin) std::swap(left, right);
+    const auto delta = right.begin - left.begin;
+    const auto row = delta / left.pitch;
+    const auto offset = delta % left.pitch;
+    return (row < uintptr_t(left.rows) && offset < left.width) ||
+           (row + 1 < uintptr_t(left.rows) &&
+            right.width > left.pitch - offset);
+  }
+  int64_t i = 0, j = 0;
+  while (i < left.rows && j < right.rows) {
+    const auto x = left.begin + uintptr_t(i) * left.pitch;
+    const auto y = right.begin + uintptr_t(j) * right.pitch;
+    if (x <= y && y - x >= left.width)
+      i += int64_t((y - x - left.width) / left.pitch + 1);
+    else if (y <= x && x - y >= right.width)
+      j += int64_t((x - y - right.width) / right.pitch + 1);
+    else
+      return true;
+  }
+  return false;
+}
+
 void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
   at::assert_no_overlap(a, b);
-  // Padded tensors need conservative storage bounds. Dense tensors still
-  // need a physical byte check when separate Storage owners hide the alias.
-  const bool padded =
-      at::get_overlap_status(a, b) == at::MemOverlapStatus::TooHard;
-  const auto a_start = reinterpret_cast<uintptr_t>(
-      padded ? a.storage().data() : a.const_data_ptr());
-  const auto b_start = reinterpret_cast<uintptr_t>(
-      padded ? b.storage().data() : b.const_data_ptr());
-  const auto a_bytes = padded ? a.storage().nbytes() : a.numel() * a.element_size();
-  const auto b_bytes = padded ? b.storage().nbytes() : b.numel() * b.element_size();
-  TORCH_CHECK(
-      a_start <= b_start ? b_start - a_start >= a_bytes
-                         : a_start - b_start >= b_bytes,
-      "GDN tensors have overlapping storage or unprovable overlap");
+  TORCH_CHECK(!physical_overlap(a, b), "GDN tensors have overlapping memory");
 }
 
 void check_no_cross_alias(
