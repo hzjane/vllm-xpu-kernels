@@ -28,6 +28,22 @@ constexpr int kWidth = kStreams * kHidden;
 constexpr int kTileN = 16;
 constexpr int kTileK = 16;
 
+void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  at::assert_no_overlap(a, b);
+  const bool padded =
+      at::get_overlap_status(a, b) == at::MemOverlapStatus::TooHard;
+  const auto a_start = reinterpret_cast<uintptr_t>(
+      padded ? a.storage().data() : a.const_data_ptr());
+  const auto b_start = reinterpret_cast<uintptr_t>(
+      padded ? b.storage().data() : b.const_data_ptr());
+  const auto a_bytes = padded ? a.storage().nbytes() : a.numel() * a.element_size();
+  const auto b_bytes = padded ? b.storage().nbytes() : b.numel() * b.element_size();
+  TORCH_CHECK(
+      a_start <= b_start ? b_start - a_start >= a_bytes
+                         : a_start - b_start >= b_bytes,
+      "probe tensors have overlapping storage or unprovable overlap");
+}
+
 template <int Rows>
 class Kernel;
 
@@ -156,9 +172,9 @@ void up_gate_mix(
   TORCH_CHECK(
       (reinterpret_cast<uintptr_t>(weight.data_ptr()) & 63u) == 0,
       "probe weight must be 64-byte aligned for 2D VNNI load");
-  at::assert_no_overlap(output, input);
-  at::assert_no_overlap(output, weight);
-  at::assert_no_overlap(output, normed);
+  check_no_overlap(output, input);
+  check_no_overlap(output, weight);
+  check_no_overlap(output, normed);
 
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
@@ -174,17 +190,16 @@ void up_gate_mix(
   const auto* w = reinterpret_cast<const half*>(weight.data_ptr<at::Half>());
   const auto* n = reinterpret_cast<const half*>(normed.data_ptr<at::Half>());
   auto* y = reinterpret_cast<half*>(output.data_ptr<at::Half>());
+  record(input, stream);
+  record(weight, stream);
+  record(normed, stream);
+  record(output, stream);
   if (m <= 2)
     launch<2>(queue, x, int(input.stride(0)), w, n, y, m);
   else if (m <= 4)
     launch<4>(queue, x, int(input.stride(0)), w, n, y, m);
   else
     launch<8>(queue, x, int(input.stride(0)), w, n, y, m);
-
-  record(input, stream);
-  record(weight, stream);
-  record(normed, stream);
-  record(output, stream);
 }
 
 }  // namespace vllm::qwen38::hc_up_dpas_probe

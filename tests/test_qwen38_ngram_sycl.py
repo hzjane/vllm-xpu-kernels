@@ -80,6 +80,18 @@ def test_hash_rejects_alias_before_submission(ops):
     assert torch.all(storage == 77).item()
 
 
+def test_hash_rejects_independent_dlpack_storage_alias(ops):
+    storage = torch.full((16,), 77, dtype=torch.int64, device="xpu")
+    inputs = torch.from_dlpack(storage[:1])
+    assert inputs.data_ptr() == storage.data_ptr()
+    assert not torch._C._overlaps(inputs, storage)
+    ctx = torch.zeros((1, 2), dtype=torch.int64, device="xpu")
+    mult = torch.tensor(MULT, device="xpu")
+    with pytest.raises(RuntimeError, match="overlap|single memory location"):
+        ops.ngram_decode_ids(inputs, ctx, mult, storage.view(1, 16))
+    assert torch.all(storage == 77).item()
+
+
 def pinned_bits(rows, dtype):
     weight = torch.empty(rows, 160, dtype=dtype, pin_memory=True)
     # Include signed zero, subnormal values, infinities and NaN payloads;

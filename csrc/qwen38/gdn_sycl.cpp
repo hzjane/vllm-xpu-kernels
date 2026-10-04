@@ -60,14 +60,32 @@ void check_indices(
       " entries");
 }
 
+void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  at::assert_no_overlap(a, b);
+  // Padded tensors need conservative storage bounds. Dense tensors still
+  // need a physical byte check when separate Storage owners hide the alias.
+  const bool padded =
+      at::get_overlap_status(a, b) == at::MemOverlapStatus::TooHard;
+  const auto a_start = reinterpret_cast<uintptr_t>(
+      padded ? a.storage().data() : a.const_data_ptr());
+  const auto b_start = reinterpret_cast<uintptr_t>(
+      padded ? b.storage().data() : b.const_data_ptr());
+  const auto a_bytes = padded ? a.storage().nbytes() : a.numel() * a.element_size();
+  const auto b_bytes = padded ? b.storage().nbytes() : b.numel() * b.element_size();
+  TORCH_CHECK(
+      a_start <= b_start ? b_start - a_start >= a_bytes
+                         : a_start - b_start >= b_bytes,
+      "GDN tensors have overlapping storage or unprovable overlap");
+}
+
 void check_no_cross_alias(
     std::initializer_list<const torch::Tensor*> writes,
     std::initializer_list<const torch::Tensor*> reads) {
   for (auto* a : writes) {
     for (auto* b : reads)
-      at::assert_no_overlap(*a, *b);
+      check_no_overlap(*a, *b);
     for (auto* b : writes) {
-      if (a != b) at::assert_no_overlap(*a, *b);
+      if (a != b) check_no_overlap(*a, *b);
     }
   }
 }
@@ -96,6 +114,10 @@ Shape check_core(
     double scale) {
   TORCH_CHECK(qkvz.is_xpu(), "GDN requires XPU tensors");
   TORCH_CHECK(std::isfinite(scale) && scale > 0.0, "invalid GDN scale");
+  const float scale_fp32 = static_cast<float>(scale);
+  TORCH_CHECK(
+      std::isfinite(scale_fp32) && scale_fp32 > 0.0f,
+      "invalid GDN scale after FP32 conversion");
   TORCH_CHECK(
       m > 0 && m <= std::numeric_limits<int>::max(), "invalid token count");
   for (auto* t : {&qkvz, &conv, &weight, &bias, &dt_bias, &ba, &ssm, &out, &z})
@@ -162,7 +184,7 @@ Shape check_core(
       static_cast<int>(conv.size(0)),
       static_cast<int>(ssm.size(0)),
       static_cast<int>(conv.size(1)),
-      static_cast<float>(scale)};
+      scale_fp32};
 }
 
 inline float sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
@@ -211,9 +233,9 @@ sycl::event launch_conv(
         const int f = id % s.dim;
         const int row = seq * spec_tokens;
         int idx = indices[row];
-        int initial_col = 0;
+        int64_t initial_col = 0;
         if constexpr (Spec) {
-          initial_col = accepted[seq] - 1;
+          initial_col = int64_t(accepted[seq]) - 1;
           if (initial_col < 0 || initial_col >= spec_tokens)
             idx = -1;
           else
@@ -323,7 +345,7 @@ sycl::event launch_conv_packed_parallel(
         const int linear_t = id / s.dim;
         const int t = linear_t % spec_tokens;
         const int row = (linear_t / spec_tokens) * spec_tokens;
-        const int initial_col = accepted[row / spec_tokens] - 1;
+        const int64_t initial_col = int64_t(accepted[row / spec_tokens]) - 1;
         const int idx = indices[row];
         const int global_t = tokens[row + t];
         const bool valid = initial_col >= 0 && initial_col < spec_tokens &&
@@ -687,7 +709,7 @@ void launch_recurrent(
           const int row = seq * spec_tokens;
           int initial_idx = indices[row];
           if constexpr (Spec) {
-            const int col = accepted[seq] - 1;
+            const int64_t col = int64_t(accepted[seq]) - 1;
             initial_idx =
                 col >= 0 && col < spec_tokens ? indices[row + col] : -1;
           }
@@ -807,7 +829,7 @@ void launch_recurrent(
                   (group % (int64_t(s.hv) * (kDim / rows_per_workgroup))) *
                       kRowsPerGroup +
                   item.get_local_linear_id() / kSubgroup;
-              const int col = accepted[seq] - 1;
+              const int64_t col = int64_t(accepted[seq]) - 1;
               const int conv_idx = indices[row];
               if (col >= 0 && col < spec_tokens && conv_idx > 0 &&
                   conv_idx < s.conv_slots) {
@@ -875,6 +897,11 @@ void gdn_decode_sycl(
   c10::OptionalDeviceGuard guard(qkvz.device());
   auto stream = c10::xpu::getCurrentXPUStream(qkvz.device().index());
   auto& queue = stream.queue();
+  // Preserve ownership even if a later submit fails after conv mutates state.
+  record_stream(
+      {&qkvz, &conv_state, &conv_weight, &conv_bias, &conv_indices, &a_log,
+       &dt_bias, &ba, &ssm_state, &ssm_indices, &output, &z},
+      stream);
   const bool root_eligible =
       s.m == 1 && s.h == 4 && queue.is_in_order() &&
       (reinterpret_cast<uintptr_t>(ssm_state.data_ptr()) & 3U) == 0 &&
@@ -896,14 +923,11 @@ void gdn_decode_sycl(
         reinterpret_cast<half*>(output.data_ptr()),
         reinterpret_cast<half*>(z.data_ptr()),
         s);
-    record_stream(
-        {&qkvz, &conv_state, &conv_weight, &conv_bias, &conv_indices, &a_log,
-         &dt_bias, &ba, &ssm_state, &ssm_indices, &output, &z},
-        stream);
     return;
   }
   // Per-call scratch is only q/k/v. The current stream and allocator own it.
   auto qkv = at::empty({s.m, s.dim}, qkvz.options());
+  record_stream({&qkv}, stream);
   const auto ready = launch_conv<false>(
       queue,
       reinterpret_cast<const half*>(qkvz.data_ptr()),
@@ -955,21 +979,6 @@ void gdn_decode_sycl(
     else
       recurrent.template operator()<4, false>();
   }
-  record_stream(
-      {&qkvz,
-       &conv_state,
-       &conv_weight,
-       &conv_bias,
-       &conv_indices,
-       &a_log,
-       &dt_bias,
-       &ba,
-       &ssm_state,
-       &ssm_indices,
-       &output,
-       &z,
-       &qkv},
-      stream);
 }
 
 void gdn_spec_v2_sycl(
@@ -1020,7 +1029,12 @@ void gdn_spec_v2_sycl(
   c10::OptionalDeviceGuard guard(qkvz.device());
   auto stream = c10::xpu::getCurrentXPUStream(qkvz.device().index());
   auto& queue = stream.queue();
+  record_stream(
+      {&qkvz, &conv_state, &conv_weight, &conv_bias, &spec_indices, &a_log,
+       &dt_bias, &ba, &ssm_state, &output, &z, &token_indices, &accepted},
+      stream);
   auto qkv = at::empty({m, s.dim}, qkvz.options());
+  record_stream({&qkv}, stream);
   const auto ready =
       s.conv_len == 3
           ? launch_conv<true>(
@@ -1083,22 +1097,6 @@ void gdn_spec_v2_sycl(
     recurrent.template operator()<true>();
   else
     recurrent.template operator()<false>();
-  record_stream(
-      {&qkvz,
-       &conv_state,
-       &conv_weight,
-       &conv_bias,
-       &spec_indices,
-       &a_log,
-       &dt_bias,
-       &ba,
-       &ssm_state,
-       &output,
-       &z,
-       &token_indices,
-       &accepted,
-       &qkv},
-      stream);
 }
 
 void gdn_norm_gate_sycl(
@@ -1134,6 +1132,7 @@ void gdn_norm_gate_sycl(
   c10::OptionalDeviceGuard guard(x.device());
   auto stream = c10::xpu::getCurrentXPUStream(x.device().index());
   auto& queue = stream.queue();
+  record_stream({&x, &z, &weight, &normalized}, stream);
   const int64_t rows = x.size(0) * x.size(1);
   auto* px = reinterpret_cast<const half*>(x.data_ptr());
   auto* pz = reinterpret_cast<const half*>(z.data_ptr());
@@ -1164,7 +1163,6 @@ void gdn_norm_gate_sycl(
           po[row * kDim + col] = half(xv[j] * inv * float(pw[col]) * gate);
         }
       });
-  record_stream({&x, &z, &weight, &normalized}, stream);
 }
 
 #ifdef QWEN38_GDN_STANDALONE_TEST
@@ -1225,6 +1223,9 @@ void gdn_spec_conv_probe_sycl(
       1.0f};
   c10::OptionalDeviceGuard guard(qkvz.device());
   auto stream = c10::xpu::getCurrentXPUStream(qkvz.device().index());
+  record_stream(
+      {&qkvz, &conv, &weight, &bias, &indices, &tokens, &accepted, &qkv, &z},
+      stream);
   if (s.conv_len == 3) {
     launch_conv<true>(
         stream.queue(),
@@ -1257,9 +1258,6 @@ void gdn_spec_conv_probe_sycl(
         1,
         static_cast<int>(m));
   }
-  record_stream(
-      {&qkvz, &conv, &weight, &bias, &indices, &tokens, &accepted, &qkv, &z},
-      stream);
 }
 #endif
 

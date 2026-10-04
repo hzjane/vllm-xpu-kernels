@@ -34,6 +34,24 @@ constexpr auto kLoadProperties = sx::properties{
     sx::full_group,
     sx::alignment<4>};
 
+void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  at::assert_no_overlap(a, b);
+  // ATen allows TooHard for padded views and No for separate Storage owners
+  // of the same physical bytes. Dense tensors use their actual byte ranges.
+  const bool padded =
+      at::get_overlap_status(a, b) == at::MemOverlapStatus::TooHard;
+  const auto a_start = reinterpret_cast<uintptr_t>(
+      padded ? a.storage().data() : a.const_data_ptr());
+  const auto b_start = reinterpret_cast<uintptr_t>(
+      padded ? b.storage().data() : b.const_data_ptr());
+  const auto a_bytes = padded ? a.storage().nbytes() : a.numel() * a.element_size();
+  const auto b_bytes = padded ? b.storage().nbytes() : b.numel() * b.element_size();
+  TORCH_CHECK(
+      a_start <= b_start ? b_start - a_start >= a_bytes
+                         : a_start - b_start >= b_bytes,
+      "HC tensors have overlapping storage or unprovable overlap");
+}
+
 void check_input(const torch::Tensor& input, int width, const char* name) {
   TORCH_CHECK(input.is_xpu(), name, " must be on XPU");
   TORCH_CHECK(input.scalar_type() == at::kHalf, name, " must be FP16");
@@ -82,8 +100,8 @@ void check_norm(
           std::isfinite(static_cast<float>(eps)) &&
           static_cast<float>(eps) > 0.0f,
       "eps must be positive finite FP32");
-  at::assert_no_overlap(output, input);
-  at::assert_no_overlap(output, weight);
+  check_no_overlap(output, input);
+  check_no_overlap(output, weight);
 }
 
 void check_gate(
@@ -93,8 +111,8 @@ void check_gate(
   check_input(input, kWidth, "input");
   check_matrix(gate, input, input.size(0), kWidth, "gate");
   check_matrix(output, input, input.size(0), kHidden, "mixed output");
-  at::assert_no_overlap(output, input);
-  at::assert_no_overlap(output, gate);
+  check_no_overlap(output, input);
+  check_no_overlap(output, gate);
 }
 
 void check_combine(
@@ -111,9 +129,9 @@ void check_combine(
           injection.stride(0) >= kStreams,
       "injection must be nonoverlapping [M,4] with unit column stride");
   check_matrix(output, hidden, hidden.size(0), kWidth, "combined output");
-  at::assert_no_overlap(output, hidden);
-  at::assert_no_overlap(output, block);
-  at::assert_no_overlap(output, injection);
+  check_no_overlap(output, hidden);
+  check_no_overlap(output, block);
+  check_no_overlap(output, injection);
 }
 
 void check_down(
@@ -128,8 +146,8 @@ void check_down(
           weight.size(1) == kWidth,
       "down weight must be [320|336,10240]");
   check_matrix(output, input, input.size(0), weight.size(0), "down output");
-  at::assert_no_overlap(output, input);
-  at::assert_no_overlap(output, weight);
+  check_no_overlap(output, input);
+  check_no_overlap(output, weight);
 }
 
 void check_up_input(
@@ -145,8 +163,8 @@ void check_up_input(
       "up input must be nonoverlapping FP16 XPU [M,320]");
   check_matrix(weight, input, kWidth, kRank, "up weight");
   check_matrix(output, input, input.size(0), out_width, "up output");
-  at::assert_no_overlap(output, input);
-  at::assert_no_overlap(output, weight);
+  check_no_overlap(output, input);
+  check_no_overlap(output, weight);
 }
 
 void check_up_gate(
@@ -156,7 +174,7 @@ void check_up_gate(
     const torch::Tensor& output) {
   check_up_input(input, weight, output, kHidden);
   check_matrix(normed, input, input.size(0), kWidth, "normed");
-  at::assert_no_overlap(output, normed);
+  check_no_overlap(output, normed);
 }
 
 void check_distinct_outputs(
@@ -164,9 +182,9 @@ void check_distinct_outputs(
     std::initializer_list<const torch::Tensor*> inputs) {
   for (const auto* out : outputs) {
     for (const auto* in : inputs)
-      at::assert_no_overlap(*out, *in);
+      check_no_overlap(*out, *in);
     for (const auto* other : outputs) {
-      if (out != other) at::assert_no_overlap(*out, *other);
+      if (out != other) check_no_overlap(*out, *other);
     }
   }
 }
@@ -232,7 +250,7 @@ void launch_norm(
     const half* hidden,
     const half* block,
     const half* injection,
-    int injection_stride,
+    int64_t injection_stride,
     const half* weight,
     half* combined,
     half* normed,
@@ -338,7 +356,7 @@ void launch_combine(
     const half* hidden,
     const half* block,
     const half* injection,
-    int injection_stride,
+    int64_t injection_stride,
     half* output,
     int m) {
   queue.parallel_for<CombineKernel>(
@@ -443,7 +461,7 @@ template <bool FusedGate>
 void launch_up(
     sycl::queue& queue,
     const half* input,
-    int input_stride,
+    int64_t input_stride,
     const half* weight,
     const half* normed,
     half* output,
@@ -508,6 +526,7 @@ void grouped_norm(
   check_norm(input, weight, output, eps);
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  record({&input, &weight, &output}, stream);
   launch_norm<false>(
       stream.queue(),
       data(input),
@@ -519,7 +538,6 @@ void grouped_norm(
       mutable_data(output),
       input.size(0),
       float(eps));
-  record({&input, &weight, &output}, stream);
 }
 
 void gate_mix(
@@ -529,13 +547,13 @@ void gate_mix(
   check_gate(input, gate, output);
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  record({&input, &gate, &output}, stream);
   launch_gate(
       stream.queue(),
       data(input),
       data(gate),
       mutable_data(output),
       input.size(0));
-  record({&input, &gate, &output}, stream);
 }
 
 void combine(
@@ -546,6 +564,7 @@ void combine(
   check_combine(hidden, block, injection, output);
   const c10::DeviceGuard guard(hidden.device());
   const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
+  record({&hidden, &block, &injection, &output}, stream);
   launch_combine(
       stream.queue(),
       data(hidden),
@@ -554,7 +573,6 @@ void combine(
       injection.stride(0),
       mutable_data(output),
       hidden.size(0));
-  record({&hidden, &block, &injection, &output}, stream);
 }
 
 void combine_norm(
@@ -571,6 +589,7 @@ void combine_norm(
       {&combined, &normed}, {&hidden, &block, &injection, &weight});
   const c10::DeviceGuard guard(hidden.device());
   const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
+  record({&hidden, &block, &injection, &weight, &combined, &normed}, stream);
   launch_norm<true>(
       stream.queue(),
       data(hidden),
@@ -582,7 +601,6 @@ void combine_norm(
       mutable_data(normed),
       hidden.size(0),
       float(eps));
-  record({&hidden, &block, &injection, &weight, &combined, &normed}, stream);
 }
 
 void down(
@@ -592,6 +610,7 @@ void down(
   check_down(input, weight, output);
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  record({&input, &weight, &output}, stream);
   const bool x_aligned = !(reinterpret_cast<uintptr_t>(input.data_ptr()) & 3);
   const bool w_aligned = !(reinterpret_cast<uintptr_t>(weight.data_ptr()) & 3);
   if (input.size(0) == 1)
@@ -614,7 +633,6 @@ void down(
         weight.size(0),
         x_aligned,
         w_aligned);
-  record({&input, &weight, &output}, stream);
 }
 
 void up(
@@ -624,6 +642,7 @@ void up(
   check_up_input(input, weight, output, kWidth);
   const c10::DeviceGuard guard(input.device());
   const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  record({&input, &weight, &output}, stream);
   const bool x_aligned = !(reinterpret_cast<uintptr_t>(input.data_ptr()) & 3) &&
                          input.stride(0) % 2 == 0;
   const bool w_aligned = !(reinterpret_cast<uintptr_t>(weight.data_ptr()) & 3);
@@ -637,7 +656,6 @@ void up(
       input.size(0),
       x_aligned,
       w_aligned);
-  record({&input, &weight, &output}, stream);
 }
 
 void up_gate_mix(
@@ -648,6 +666,7 @@ void up_gate_mix(
   check_up_gate(lowrank, weight, normed, output);
   const c10::DeviceGuard guard(lowrank.device());
   const auto stream = c10::xpu::getCurrentXPUStream(lowrank.get_device());
+  record({&lowrank, &weight, &normed, &output}, stream);
   const bool x_aligned =
       !(reinterpret_cast<uintptr_t>(lowrank.data_ptr()) & 3) &&
       lowrank.stride(0) % 2 == 0;
@@ -662,7 +681,6 @@ void up_gate_mix(
       lowrank.size(0),
       x_aligned,
       w_aligned);
-  record({&lowrank, &weight, &normed, &output}, stream);
 }
 
 static void combine_mix_impl(
@@ -700,6 +718,21 @@ static void combine_mix_impl(
   const c10::DeviceGuard guard(hidden.device());
   const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
   auto& queue = stream.queue();
+  TORCH_CHECK(queue.is_in_order(),
+              "HC transaction requires an in-order current stream");
+  // A later submission may throw after norm/down already use these pointers.
+  record(
+      {&hidden,
+       &block,
+       &injection,
+       &norm_weight,
+       &down_weight,
+       &up_weight,
+       &combined,
+       &normed,
+       &down_output,
+       &mixed},
+      stream);
   launch_norm<true>(
       queue,
       data(hidden),
@@ -749,18 +782,6 @@ static void combine_mix_impl(
       hidden.size(0),
       low_aligned,
       up_w_aligned);
-  record(
-      {&hidden,
-       &block,
-       &injection,
-       &norm_weight,
-       &down_weight,
-       &up_weight,
-       &combined,
-       &normed,
-       &down_output,
-       &mixed},
-      stream);
 }
 
 void combine_mix(
@@ -835,6 +856,9 @@ void project_mix(
   const c10::DeviceGuard guard(normed.device());
   const auto stream = c10::xpu::getCurrentXPUStream(normed.get_device());
   auto& queue = stream.queue();
+  TORCH_CHECK(queue.is_in_order(),
+              "HC transaction requires an in-order current stream");
+  record({&normed, &down_weight, &up_weight, &down_output, &mixed}, stream);
   const bool norm_aligned =
       !(reinterpret_cast<uintptr_t>(normed.data_ptr()) & 3);
   const bool down_w_aligned =
@@ -873,7 +897,6 @@ void project_mix(
       normed.size(0),
       low_aligned,
       up_w_aligned);
-  record({&normed, &down_weight, &up_weight, &down_output, &mixed}, stream);
 }
 
 }  // namespace vllm::qwen38::hc

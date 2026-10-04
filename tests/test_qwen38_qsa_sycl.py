@@ -127,7 +127,7 @@ def compression_golden(case, capacity):
 @pytest.mark.parametrize("rows", [1, 2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_group_compression_golden_and_final_esimd(native, rows, dtype):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = compression_case(rows, dtype)
     pooled = torch.empty_like(case[0])
@@ -192,7 +192,7 @@ def test_group_compression_non_power_of_two_ring(native):
 
 
 def test_group_compression_mixed_requests(native):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = list(compression_case(4, torch.float16))
     case[4] = torch.tensor([[0], [1]], dtype=torch.int32, device="xpu")
@@ -284,7 +284,7 @@ def attention_golden(case):
 ])
 def test_attention_golden_and_final_esimd(native, rows, heads, length,
                                            page_size):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = attention_case(rows, heads, length, page_size)
     output = torch.empty_like(case[0])
@@ -396,7 +396,7 @@ def test_attention_unaligned_packed_cache(native):
 
 
 def test_attention_mixed_request_block_tables(native):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = list(attention_case(4, 6, 1024, 256))
     second = torch.randn_like(case[1])
@@ -501,7 +501,7 @@ def assert_random_selection_membership_and_tail(actual, expected):
     (1, 131071, 64), (1, 256000, 128),
 ])
 def test_selection_golden_and_final_esimd(native, rows, length, page_size):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = selection_case(rows, length, page_size)
     native.select_paged_tokens_v2(*case)
@@ -721,7 +721,7 @@ def test_aux_qkv_rejects_missing_position_proof_before_submit(native):
 
 @pytest.mark.parametrize("rows,mrope", [(1, False), (8, True), (65, True)])
 def test_aux_indexer_norm_rope_final_esimd(native, rows, mrope):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     torch.manual_seed(377 + rows)
     x = torch.randn(rows, 4, 128, dtype=torch.float16, device="xpu")
@@ -1246,6 +1246,67 @@ def test_selection_rejects_alias_before_write(native):
     assert bool((shared == 0).all())
 
 
+@pytest.mark.parametrize("entry", ["compression", "selection", "attention",
+                                   "indexer", "qkv"])
+def test_lazy_anchor_rejected_before_any_output_write(native, entry):
+    # Direct Pybind bypasses the Torch dispatcher negative-view fallback.
+    # Shape/dtype/contiguity alone cannot prove data_ptr() is the logical input.
+    if entry == "compression":
+        case = list(compression_case(1, torch.float16))
+        case[0] = case[0]._neg_view()
+        pooled = torch.full_like(case[0], 7)
+        first = torch.full((1, 3), 11, dtype=torch.int64, device="xpu")
+        outputs = (pooled, first)
+        invoke = lambda: native.group_compress_v2(
+            *case, pooled, first, 4, 100, True)
+    elif entry == "selection":
+        case = list(selection_case(1, 1024, 128))
+        case[0] = case[0]._neg_view()
+        outputs = tuple(case[8:])
+        for output in outputs:
+            output.fill_(7)
+        invoke = lambda: native.select_paged_tokens_v2(*case)
+    elif entry == "attention":
+        case = list(attention_case(1, 6, 1024, 256))
+        case[0] = case[0]._neg_view()
+        output = torch.full_like(case[0], 7)
+        partials = torch.full((1, 6, 43, 258), 7, dtype=torch.float32,
+                              device="xpu")
+        outputs = (output, partials)
+        invoke = lambda: native.token_split_attention_v3(
+            *case, 256, output, partials)
+    elif entry == "indexer":
+        input = torch.ones(1, 4, 128, dtype=torch.float16,
+                           device="xpu")._neg_view()
+        output = torch.full_like(input, 7)
+        weight = torch.zeros(128, dtype=torch.float16, device="xpu")
+        positions = torch.zeros(1, dtype=torch.int32, device="xpu")
+        cache = torch.ones(1, 64, dtype=torch.float16, device="xpu")
+        outputs = (output,)
+        invoke = lambda: native.qsa_sycl_indexer_norm_rope_v2(
+            input, output, weight, positions, cache, False, False, True)
+    else:
+        input = torch.ones(1, 8 * 256, dtype=torch.float16,
+                           device="xpu")._neg_view()
+        q = torch.full((1, 3 * 256), 7, dtype=torch.float16, device="xpu")
+        gate = torch.full_like(q, 7)
+        k = torch.full((1, 256), 7, dtype=torch.float16, device="xpu")
+        v = torch.full_like(k, 7)
+        weight = torch.zeros(256, dtype=torch.float16, device="xpu")
+        positions = torch.zeros(1, dtype=torch.int32, device="xpu")
+        cache = torch.ones(1, 64, dtype=torch.float16, device="xpu")
+        outputs = (q, gate, k, v)
+        invoke = lambda: native.qsa_sycl_qkv_postprocess_v1(
+            input, q, gate, k, v, weight, weight, positions, cache,
+            3, 1, True, False, True)
+    snapshots = tuple(output.clone() for output in outputs)
+    with pytest.raises(RuntimeError, match="lazy view"):
+        invoke()
+    torch.xpu.synchronize()
+    for output, snapshot in zip(outputs, snapshots):
+        assert torch.equal(output.cpu(), snapshot.cpu())
+
+
 @pytest.mark.parametrize("position,sequence_length", [(-2, 1024),
                                                       (1023, -1)])
 def test_selection_invalid_device_metadata_is_empty(native, position,
@@ -1258,7 +1319,7 @@ def test_selection_invalid_device_metadata_is_empty(native, position,
 
 
 def test_selection_mixed_request_lengths_and_tables(native):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = list(selection_case(4, 1024, 128))
     case[1] = torch.cat((case[1], torch.randn_like(case[1])), dim=0)
@@ -1278,7 +1339,7 @@ def test_selection_mixed_request_lengths_and_tables(native):
 
 
 def test_selection_long_mixed_request_tail_position(native):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     case = list(selection_case(2, 131072, 128))
     physical_pages = case[1].size(0)
@@ -1313,7 +1374,7 @@ def test_selection_nondefault_stream(native):
 
 
 def test_two_nondefault_streams_keep_private_workspaces(native):
-    import custom_esimd_kernels_vllm.qsa_ops as reference
+    reference = pytest.importorskip("custom_esimd_kernels_vllm.qsa_ops")
 
     streams = [torch.xpu.Stream(), torch.xpu.Stream()]
     results = []

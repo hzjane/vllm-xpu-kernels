@@ -84,6 +84,19 @@ void check_device(
   check_physical(t, name);
 }
 
+// Both tensors have already passed the contiguous physical-tensor checks.
+// ATen's storage-based check alone misses independently wrapped allocations.
+void check_no_alias(const at::Tensor& output, const at::Tensor& input) {
+  if (output.numel() == 0 || input.numel() == 0) return;
+  at::assert_no_overlap(output, input);
+  const auto output_begin = reinterpret_cast<uintptr_t>(output.const_data_ptr());
+  const auto input_begin = reinterpret_cast<uintptr_t>(input.const_data_ptr());
+  const bool overlap = output_begin >= input_begin
+                           ? output_begin - input_begin < input.nbytes()
+                           : input_begin - output_begin < output.nbytes();
+  TORCH_CHECK(!overlap, "NGram output must not overlap an input address range");
+}
+
 void record_xpu(const at::Tensor& t, c10::xpu::XPUStream stream) {
   c10::xpu::XPUCachingAllocator::recordStream(t.storage().data_ptr(), stream);
 }
@@ -117,7 +130,7 @@ void ngram_decode_ids(
       output.dim() == 2 && output.size(0) == m && output.size(1) == 16,
       "output must be [M,16]");
   for (const auto* t : {&input_ids, &context, &multipliers}) {
-    at::assert_no_overlap(output, *t);
+    check_no_alias(output, *t);
   }
   const c10::OptionalDeviceGuard guard(input_ids.device());
   auto stream = c10::xpu::getCurrentXPUStream(input_ids.get_device());
@@ -170,7 +183,7 @@ at::Tensor ngram_host_lookup_chunked(
       ids.dim() == 2 && ids.size(1) == 16 && output.dim() == 2 &&
           output.size(0) == ids.size(0) && output.size(1) == 2560,
       "NGram lookup expects ids [M,16], output [M,2560]");
-  at::assert_no_overlap(ids, output);
+  check_no_alias(output, ids);
   std::array<const uint16_t*, 8> tables{};
   int64_t total_rows = 0;
   int64_t chunk_rows = 0;
@@ -183,6 +196,9 @@ at::Tensor ngram_host_lookup_chunked(
     TORCH_CHECK(
         weight.scalar_type() == output.scalar_type(),
         "NGram weights/output must have the same FP16/BF16 dtype");
+    // Host-USM can also be wrapped as an XPU tensor; device labels alone do
+    // not prove that the writable output is disjoint from a pinned table.
+    check_no_alias(output, weight);
     if (index == 0) chunk_rows = weight.size(0);
     TORCH_CHECK(
         weight.size(0) > 0 && weight.size(0) <= chunk_rows &&

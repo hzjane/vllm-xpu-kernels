@@ -319,6 +319,7 @@ at::Tensor qkv_postprocess_v1(
     const at::Tensor& cos_sin_cache, int64_t q_heads, int64_t kv_heads,
     bool attn_output_gate, bool mrope, bool positions_bounds_proven) {
   TORCH_CHECK(qkv.is_xpu(), "QKV input must be XPU");
+  check_xpu(qkv, qkv, at::kHalf, "QKV input");
   TORCH_CHECK(positions_bounds_proven,
               "QKV postprocess requires producer position-bound proof");
   const std::array<const at::Tensor*, 7> fp16_tensors = {
@@ -375,6 +376,8 @@ at::Tensor qkv_postprocess_v1(
   auto stream = c10::xpu::getCurrentXPUStream(qkv.get_device());
   auto& queue = stream.queue();
   TORCH_CHECK(queue.is_in_order(), "QKV requires an in-order current stream");
+  record_tensors({&qkv, &q_out, &gate_out, &k_out, &v_out, &norm_wq,
+                  &norm_wk, &positions, &cos_sin_cache}, stream);
   const auto* packed = static_cast<const half*>(qkv.data_ptr());
   auto* q = static_cast<half*>(q_out.data_ptr());
   auto* g = static_cast<half*>(gate_out.data_ptr());
@@ -399,8 +402,6 @@ at::Tensor qkv_postprocess_v1(
   } else {
     launch(std::false_type{}, std::type_identity<int64_t>{});
   }
-  record_tensors({&qkv, &q_out, &gate_out, &k_out, &v_out, &norm_wq,
-                  &norm_wk, &positions, &cos_sin_cache}, stream);
   return q_out;
 }
 
@@ -409,6 +410,7 @@ at::Tensor indexer_norm_rope_v2(
     const at::Tensor& positions, const at::Tensor& cos_sin_cache,
     bool mrope, bool eager_fp16, bool positions_bounds_proven) {
   TORCH_CHECK(input.is_xpu(), "indexer input must be XPU");
+  check_xpu(input, input, at::kHalf, "indexer input");
   // Legacy v1 supplies producer proof. Legacy v2 does not, but its eager
   // FP16 path guards every cache read in the device kernel, so it needs no
   // fabricated host proof. The non-eager path remains proof gated.
@@ -453,6 +455,8 @@ at::Tensor indexer_norm_rope_v2(
   auto& queue = stream.queue();
   TORCH_CHECK(queue.is_in_order(),
               "indexer norm+RoPE requires an in-order current stream");
+  record_tensors({&input, &output, &weight, &positions, &cos_sin_cache},
+                 stream);
   auto launch = [&](auto mrope_tag, auto eager_tag, auto pos_tag) {
     using PosT = typename decltype(pos_tag)::type;
     launch_indexer<decltype(mrope_tag)::value,
@@ -485,8 +489,6 @@ at::Tensor indexer_norm_rope_v2(
     else
       launch(std::false_type{}, std::false_type{}, std::type_identity<int64_t>{});
   }
-  record_tensors({&input, &output, &weight, &positions, &cos_sin_cache},
-                 stream);
   return output;
 }
 
@@ -515,13 +517,13 @@ at::Tensor indexer_projection_int4_v1(
   auto& queue = stream.queue();
   TORCH_CHECK(queue.is_in_order(),
               "indexer projection requires an in-order current stream");
+  record_tensors({&input, &packed_weight, &group_scales, &output}, stream);
   const auto* x = static_cast<const half*>(input.data_ptr());
   const auto* packed = packed_weight.data_ptr<uint8_t>();
   const auto* scales = static_cast<const half*>(group_scales.data_ptr());
   auto* out = static_cast<half*>(output.data_ptr());
   const int rows = input.size(0);
   launch_projection_int4(queue, x, packed, scales, out, rows);
-  record_tensors({&input, &packed_weight, &group_scales, &output}, stream);
   return output;
 }
 

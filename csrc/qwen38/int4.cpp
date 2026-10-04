@@ -21,6 +21,20 @@ using half = sycl::half;
 using bfloat16 = sycl::ext::oneapi::bfloat16;
 constexpr int kGroup = 128;
 
+void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  at::assert_no_overlap(a, b);
+  // All INT4 tensors are contiguous; ATen can miss physical overlap between
+  // independent Storage owners (for example a DLPack round trip).
+  const auto a_start = reinterpret_cast<uintptr_t>(a.const_data_ptr());
+  const auto b_start = reinterpret_cast<uintptr_t>(b.const_data_ptr());
+  const auto a_bytes = a.numel() * a.element_size();
+  const auto b_bytes = b.numel() * b.element_size();
+  TORCH_CHECK(
+      a_start <= b_start ? b_start - a_start >= a_bytes
+                         : a_start - b_start >= b_bytes,
+      "INT4 tensors have overlapping physical memory");
+}
+
 void check_tensor(
     const torch::Tensor& t,
     const torch::Tensor& input,
@@ -66,9 +80,9 @@ void check_projection(
   TORCH_CHECK(
       output.size(0) == input.size(0) && output.size(1) == n,
       "output must be [M,N]");
-  at::assert_no_overlap(output, input);
-  at::assert_no_overlap(output, weight);
-  at::assert_no_overlap(output, scale);
+  check_no_overlap(output, input);
+  check_no_overlap(output, weight);
+  check_no_overlap(output, scale);
 }
 
 // Preserve allocations when a caller drops tensors before a non-default
@@ -455,9 +469,9 @@ void q4_0_quantize(
   TORCH_CHECK(
       scale.size(0) == input.size(0) && scale.size(1) == input.size(1) / kGroup,
       "scale must be [N,K/128]");
-  at::assert_no_overlap(qweight, input);
-  at::assert_no_overlap(scale, input);
-  at::assert_no_overlap(qweight, scale);
+  check_no_overlap(qweight, input);
+  check_no_overlap(scale, input);
+  check_no_overlap(qweight, scale);
   const c10::OptionalDeviceGuard guard(input.device());
   auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
   record_stream({&input, &qweight, &scale}, stream);
@@ -511,11 +525,11 @@ void int4_linear_fused2(
       "fused projection requires M=1 FP16 input");
   check_projection(input, weight0, scale0, output0);
   check_projection(input, weight1, scale1, output1);
-  at::assert_no_overlap(output0, weight1);
-  at::assert_no_overlap(output0, scale1);
-  at::assert_no_overlap(output1, weight0);
-  at::assert_no_overlap(output1, scale0);
-  at::assert_no_overlap(output0, output1);
+  check_no_overlap(output0, weight1);
+  check_no_overlap(output0, scale1);
+  check_no_overlap(output1, weight0);
+  check_no_overlap(output1, scale0);
+  check_no_overlap(output0, output1);
   TORCH_CHECK(
       weight0.size(0) + weight1.size(0) <= std::numeric_limits<int>::max(),
       "fused N exceeds the kernel index range");

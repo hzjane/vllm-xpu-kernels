@@ -542,3 +542,20 @@ def test_workspace_async_stream_partition(hc):
     expected = ref_combine(x, block, inj)
     for result in results:
         torch.testing.assert_close(result[0], expected, atol=1e-3, rtol=0)
+
+
+@pytest.mark.parametrize("reader", ["injection", "lowrank"])
+def test_padded_alias_rejected_before_submit(hc, reader):
+    output = torch.full((2, 10240), 7, device="xpu", dtype=torch.float16)
+    if reader == "injection":
+        hidden = torch.zeros_like(output)
+        block = torch.zeros((2, 2560), device="xpu", dtype=torch.float16)
+        injection = output[:, :4]  # ATen overlap status is TooHard.
+        with pytest.raises(RuntimeError, match="overlap"):
+            hc.combine(hidden, block, injection, output)
+    else:
+        lowrank = output[:, :320]
+        weight = torch.empty((10240, 320), device="xpu", dtype=torch.float16)
+        with pytest.raises(RuntimeError, match="overlap"):
+            hc.up(lowrank, weight, output)
+    assert torch.all(output == 7).item()

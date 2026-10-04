@@ -21,6 +21,38 @@ constexpr int kHidden = 2560;
 constexpr int kExperts = 512;
 constexpr int kTopK = 10;
 
+struct ByteRange {
+  uintptr_t begin, end;
+};
+
+// Independently wrapped tensors may share an allocation without sharing a
+// StorageImpl. Use a conservative strided address span as well as ATen's check.
+ByteRange byte_range(const at::Tensor& t) {
+  TORCH_CHECK(
+      t.layout() == at::kStrided, "MoE alias check requires strided tensors");
+  const auto begin = reinterpret_cast<uintptr_t>(t.const_data_ptr());
+  if (t.numel() == 0) return {begin, begin};
+  constexpr auto max = std::numeric_limits<uintptr_t>::max();
+  uintptr_t last = 0;
+  for (int64_t d = 0; d < t.dim(); ++d) {
+    TORCH_CHECK(
+        t.stride(d) >= 0, "MoE alias check requires nonnegative strides");
+    const auto extent = static_cast<uintptr_t>(t.size(d) - 1);
+    const auto stride = static_cast<uintptr_t>(t.stride(d));
+    TORCH_CHECK(
+        stride == 0 || extent <= max / stride, "MoE address range overflows");
+    const auto contribution = extent * stride;
+    TORCH_CHECK(last <= max - contribution, "MoE address range overflows");
+    last += contribution;
+  }
+  const auto item_bytes = static_cast<uintptr_t>(t.element_size());
+  TORCH_CHECK(
+      item_bytes > 0 && last < max / item_bytes, "MoE byte range overflows");
+  const auto bytes = (last + 1) * item_bytes;
+  TORCH_CHECK(begin <= max - bytes, "MoE byte range overflows");
+  return {begin, begin + bytes};
+}
+
 bool compatible(
     const at::Tensor& t,
     c10::Device device,
@@ -143,12 +175,17 @@ int64_t compact_weight_contract(
 }
 
 bool output_overlaps(const at::Tensor& output, at::TensorList inputs) {
-  if (!output.defined()) return false;
+  if (!output.defined() || output.numel() == 0) return false;
+  const auto output_range = byte_range(output);
   for (const auto& input : inputs) {
     if (!input.defined() || input.device() != output.device() ||
         input.numel() == 0)
       continue;
     if (at::get_overlap_status(output, input) != at::MemOverlapStatus::No)
+      return true;
+    const auto input_range = byte_range(input);
+    if (output_range.begin < input_range.end &&
+        input_range.begin < output_range.end)
       return true;
   }
   return false;

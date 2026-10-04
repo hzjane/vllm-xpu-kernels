@@ -230,3 +230,15 @@ def test_current_stream_and_dropped_input_lifetime(ops):
                                rtol=1e-3,
                                atol=4e-3)
     del junk
+
+
+def test_dlpack_physical_alias_rejected_before_submit(ops):
+    x = torch.ones(1, 128, dtype=torch.float16, device="xpu")
+    output = torch.from_dlpack(x)
+    assert output.data_ptr() == x.data_ptr()
+    assert not torch._C._overlaps(output, x)  # Independent Storage owners.
+    weight = torch.zeros(128, 64, dtype=torch.uint8, device="xpu")
+    scale = torch.ones(128, 1, dtype=torch.float16, device="xpu")
+    with pytest.raises(RuntimeError, match="overlap"):
+        ops.int4_linear(x, weight, scale, output)
+    assert torch.all(x == 1).item()

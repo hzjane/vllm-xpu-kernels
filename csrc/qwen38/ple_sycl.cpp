@@ -149,16 +149,19 @@ void check_offsets(
   }
 }
 
-void check_unique_slots(const at::Tensor& slots, int64_t n, int64_t null_id) {
+std::vector<int64_t> check_unique_slots(
+    const at::Tensor& slots, int64_t n, int64_t null_id) {
   TORCH_CHECK(
       null_id < 0 || null_id >= n,
       "untrusted null_block_id must not be a real state slot");
   std::unordered_set<int64_t> seen;
-  for (const auto value : index_values(slots)) {
+  auto values = index_values(slots);
+  for (const auto value : values) {
     if (value == null_id) continue;
     TORCH_CHECK(value >= 0 && value < n, "state index out of bounds");
     TORCH_CHECK(seen.insert(value).second, "duplicate state index");
   }
+  return values;
 }
 
 void check_trusted_null(int64_t n, int64_t null_id) {
@@ -215,6 +218,7 @@ void check_state(
     int64_t required_width,
     bool dim_first) {
   check_xpu(input, "input");
+  check_xpu(state, "conv_state");
   TORCH_CHECK(
       input.scalar_type() == at::kHalf && input.dim() == 2 &&
           input.size(1) > 0 && input.is_contiguous(),
@@ -502,6 +506,15 @@ at::Tensor ngram_ids(
   const auto* head_offsets = offsets.data_ptr<int64_t>();
   auto* out = output.data_ptr<int64_t>();
   const int64_t tokens = input_ids.numel();
+  record_stream(
+      stream,
+      {&input_ids,
+       &query_start_loc,
+       &ngram_context,
+       &layer_multipliers,
+       &vocab_sizes,
+       &offsets,
+       &output});
   queue.parallel_for(sycl::range<1>(tokens * heads), [=](sycl::id<1> id) {
     const int64_t token = id[0] / heads;
     const int64_t head = id[0] % heads;
@@ -536,15 +549,6 @@ at::Tensor ngram_ids(
     if (remainder < 0) remainder += modulus;
     out[token * heads + head] = remainder + head_offsets[head];
   });
-  record_stream(
-      stream,
-      {&input_ids,
-       &query_start_loc,
-       &ngram_context,
-       &layer_multipliers,
-       &vocab_sizes,
-       &offsets,
-       &output});
   return output;
 }
 
@@ -585,6 +589,7 @@ at::Tensor embedding_gather(
   auto* out = reinterpret_cast<half*>(output.data_ptr());
   const int64_t heads = ids.size(1);
   const int64_t width = weight.size(1);
+  record_stream(stream, {&ids, &weight, &local_start, &local_rows, &output});
   queue.parallel_for(sycl::range<1>(output.numel()), [=](sycl::id<1> id) {
     const int64_t linear = id[0];
     const int64_t head = (linear / width) % heads;
@@ -594,7 +599,6 @@ at::Tensor embedding_gather(
                       ? w[row * width + linear % width]
                       : half(0.0f);
   });
-  record_stream(stream, {&ids, &weight, &local_start, &local_rows, &output});
   return output;
 }
 
@@ -626,6 +630,7 @@ at::Tensor grouped_norm(
   auto* y = reinterpret_cast<half*>(output.data_ptr());
   const int64_t width = input.size(-1);
   const float epsilon = static_cast<float>(eps);
+  record_stream(stream, {&input, &weight, &output});
   queue.parallel_for(
       sycl::nd_range<1>(groups * kReduceLocal, kReduceLocal),
       [=](sycl::nd_item<1> item) {
@@ -648,7 +653,6 @@ at::Tensor grouped_norm(
               (1.0f + static_cast<float>(w[within + j])));
         }
       });
-  record_stream(stream, {&input, &weight, &output});
   return output;
 }
 
@@ -672,6 +676,7 @@ at::Tensor score_gate(
   const auto* a = reinterpret_cast<const half*>(key.data_ptr());
   const auto* b = reinterpret_cast<const half*>(query.data_ptr());
   auto* y = reinterpret_cast<half*>(output.data_ptr());
+  record_stream(stream, {&key, &query, &output});
   queue.parallel_for(
       sycl::nd_range<1>(groups * kReduceLocal, kReduceLocal),
       [=](sycl::nd_item<1> item) {
@@ -692,7 +697,6 @@ at::Tensor score_gate(
           y[group] = half(sigmoid(signed_root));
         }
       });
-  record_stream(stream, {&key, &query, &output});
   return output;
 }
 
@@ -717,6 +721,7 @@ at::Tensor gated_value(
   const auto* x = reinterpret_cast<const half*>(value.data_ptr());
   auto* y = reinterpret_cast<half*>(output.data_ptr());
   const int64_t width = value.size(-1);
+  record_stream(stream, {&gate, &value, &output});
   queue.parallel_for(sycl::range<1>(output.numel()), [=](sycl::id<1> id) {
     const int64_t linear = id[0];
     const int64_t group = linear / width;
@@ -725,7 +730,6 @@ at::Tensor gated_value(
         static_cast<float>(g[group]) *
         static_cast<float>(x[row * width + linear % width]));
   });
-  record_stream(stream, {&gate, &value, &output});
   return output;
 }
 
@@ -764,6 +768,8 @@ at::Tensor gated_value_grouped_norm(
   auto* raw = reinterpret_cast<half*>(raw_output.data_ptr());
   auto* norm = reinterpret_cast<half*>(normalized_output.data_ptr());
   const float epsilon = static_cast<float>(eps);
+  record_stream(
+      stream, {&gate, &value, &weight, &raw_output, &normalized_output});
   queue.parallel_for(
       sycl::nd_range<1>(kHcCount * kFusedLocal, kFusedLocal),
       [=](sycl::nd_item<1> item) {
@@ -791,8 +797,6 @@ at::Tensor gated_value_grouped_norm(
               (1.0f + static_cast<float>(w[group * kHcHidden + j])));
         }
       });
-  record_stream(
-      stream, {&gate, &value, &weight, &raw_output, &normalized_output});
   return raw_output;
 }
 
@@ -813,11 +817,11 @@ residual_add(at::Tensor first, at::Tensor second, at::Tensor output) {
   const auto* a = reinterpret_cast<const half*>(first.data_ptr());
   const auto* b = reinterpret_cast<const half*>(second.data_ptr());
   auto* y = reinterpret_cast<half*>(output.data_ptr());
+  record_stream(stream, {&first, &second, &output});
   queue.parallel_for(sycl::range<1>(output.numel()), [=](sycl::id<1> id) {
     y[id[0]] =
         half(static_cast<float>(a[id[0]]) + static_cast<float>(b[id[0]]));
   });
-  record_stream(stream, {&first, &second, &output});
   return output;
 }
 
@@ -970,7 +974,7 @@ at::Tensor short_conv_impl(
     // storage alias checks above remain unconditional.
     check_trusted_null(state.size(0), null_id);
   } else {
-    check_unique_slots(slots, state.size(0), null_id);
+    const auto slot_values = check_unique_slots(slots, state.size(0), null_id);
     if (mode != ConvMode::Decode) {
       check_offsets(starts, requests, input.size(0));
       if (mode == ConvMode::Spec) {
@@ -981,10 +985,13 @@ at::Tensor short_conv_impl(
           TORCH_CHECK(
               query_length <= spec_tokens + 1,
               "spec query length exceeds num_spec_tokens + 1");
-          TORCH_CHECK(
-              counts[r] >= 1 && counts[r] <= spec_tokens + 1 &&
-                  (query_length == 0 || counts[r] <= query_length),
-              "num_accepted_tokens outside valid query length");
+          // accepted describes the previous query, not this query's length.
+          // Null/empty requests return before reading it in launch_spec.
+          if (slot_values[r] != null_id && query_length > 0) {
+            TORCH_CHECK(
+                counts[r] >= 1 && counts[r] <= spec_tokens + 1,
+                "num_accepted_tokens outside valid rollback capacity");
+          }
         }
       }
     }
@@ -995,6 +1002,11 @@ at::Tensor short_conv_impl(
   const c10::OptionalDeviceGuard guard(input.device());
   auto stream = c10::xpu::getCurrentXPUStream(input.device().index());
   auto& queue = stream.queue();
+  // Record every owner before submission, including exceptions from submit.
+  record_stream(stream, {&input, &state, &weights, &slots, &output});
+  if (mode != ConvMode::Spec) record_stream(stream, {&initial});
+  if (mode != ConvMode::Decode) record_stream(stream, {&starts});
+  if (mode == ConvMode::Spec) record_stream(stream, {&accepted});
   auto run =
       [&](auto state_tag, auto index_tag, auto offset_tag, auto accepted_tag) {
         using State = decltype(state_tag);
@@ -1046,10 +1058,6 @@ at::Tensor short_conv_impl(
   } else {
     run_indices(float{}, int64_t{});
   }
-  record_stream(stream, {&input, &state, &weights, &slots, &output});
-  if (mode != ConvMode::Spec) record_stream(stream, {&initial});
-  if (mode != ConvMode::Decode) record_stream(stream, {&starts});
-  if (mode == ConvMode::Spec) record_stream(stream, {&accepted});
   return output;
 }
 

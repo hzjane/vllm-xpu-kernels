@@ -27,6 +27,18 @@ constexpr int kRowsPerGroup = 16;
 static_assert(kHeadSize / 2 == kSubgroup * sizeof(uint32_t));
 class GdnNormInt4FusedKernel;
 
+void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  at::assert_no_overlap(a, b);
+  const auto a_start = reinterpret_cast<uintptr_t>(a.const_data_ptr());
+  const auto b_start = reinterpret_cast<uintptr_t>(b.const_data_ptr());
+  const auto a_bytes = a.numel() * a.element_size();
+  const auto b_bytes = b.numel() * b.element_size();
+  TORCH_CHECK(
+      a_start <= b_start ? b_start - a_start >= a_bytes
+                         : a_start - b_start >= b_bytes,
+      "GDN INT4 tensors have overlapping physical memory");
+}
+
 // The final ESIMD path retains FP32 normalized values in work-group storage.
 void launch_fused(
     sycl::queue& queue, const half* x, const half* z,
@@ -168,7 +180,13 @@ void gdn_norm_int4_sycl(
           output.size(0) == 1 && output.size(1) == int4_weight.size(0),
       "invalid GDN INT4 output shapes");
   for (const auto* input : {&x, &z, &norm_weight, &int4_weight, &int4_scale})
-    at::assert_no_overlap(output, *input);
+    check_no_overlap(output, *input);
+
+  c10::OptionalDeviceGuard guard(device);
+  auto stream = c10::xpu::getCurrentXPUStream(device.index());
+  auto& queue = stream.queue();
+  TORCH_CHECK(queue.is_in_order(),
+              "GDN INT4 projection requires an in-order current stream");
 
   // Preserve the established two-kernel path for offset/misaligned views.
   const uintptr_t alignment = reinterpret_cast<uintptr_t>(x.data_ptr()) |
@@ -179,11 +197,6 @@ void gdn_norm_int4_sycl(
                               reinterpret_cast<uintptr_t>(output.data_ptr());
   if (hv == kHeads && sigmoid_gate && int4_weight.size(0) == 2560 &&
       (alignment & 3U) == 0) {
-    c10::OptionalDeviceGuard guard(device);
-    auto stream = c10::xpu::getCurrentXPUStream(device.index());
-    auto& queue = stream.queue();
-    TORCH_CHECK(queue.is_in_order(),
-                "GDN INT4 projection requires an in-order current stream");
     // Record before submit for dropped inputs on a non-default stream.
     for (const auto* t : std::initializer_list<const torch::Tensor*>{
              &x, &z, &norm_weight, &int4_weight, &int4_scale, &output})

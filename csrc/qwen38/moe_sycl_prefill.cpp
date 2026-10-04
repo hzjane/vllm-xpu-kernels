@@ -32,15 +32,17 @@ void launch_prefix(sycl::queue& queue, const PrefillDown& a, bool active_mode) {
     cgh.parallel_for<MoePrefillPrefix>(
         sycl::nd_range<1>(kExperts, kExperts), [=](sycl::nd_item<1> item) {
           const int e = int(item.get_local_linear_id());
-          const int raw_count = counts[e];
-          const int count = sycl::max(raw_count, 0);
-          const int tile_count = (count + kTileM - 1) / kTileM;
+          const int64_t raw_count = counts[e];
+          const int64_t count = sycl::max(raw_count, int64_t(0));
+          const int64_t tile_count = (count + kTileM - 1) / kTileM;
           const auto group = item.get_group();
           const int any_negative = sycl::reduce_over_group(
               group, raw_count < 0 ? 1 : 0, sycl::maximum<int>());
-          const int row_start =
-              sycl::exclusive_scan_over_group(group, count, sycl::plus<int>());
-          rows[e] = row_start;
+          // A malformed int32 sum can wrap to m and pass the old sentinel,
+          // leaving negative row offsets. Scan wide and narrow only in bounds.
+          const int64_t row_start = sycl::exclusive_scan_over_group(
+              group, count, sycl::plus<int64_t>());
+          rows[e] = row_start <= a.m ? int(row_start) : -1;
           if (active_mode) {
             const int active_rank = sycl::exclusive_scan_over_group(
                 group, count > 0 ? 1 : 0, sycl::plus<int>());
@@ -48,13 +50,19 @@ void launch_prefix(sycl::queue& queue, const PrefillDown& a, bool active_mode) {
             if (e == kExperts - 1)
               tiles[kExperts] = active_rank + (count > 0 ? 1 : 0);
           } else {
-            const int tile_start = sycl::exclusive_scan_over_group(
-                group, tile_count, sycl::plus<int>());
-            tiles[e] = tile_start;
-            if (e == kExperts - 1) tiles[kExperts] = tile_start + tile_count;
+            const int64_t tile_start = sycl::exclusive_scan_over_group(
+                group, tile_count, sycl::plus<int64_t>());
+            const int64_t bound = int64_t(a.m) + kExperts;
+            tiles[e] = tile_start <= bound ? int(tile_start) : -1;
+            if (e == kExperts - 1)
+              tiles[kExperts] = tile_start + tile_count <= bound
+                                    ? int(tile_start + tile_count)
+                                    : -1;
           }
           if (e == kExperts - 1) {
-            rows[kExperts] = any_negative ? -1 : row_start + count;
+            rows[kExperts] = any_negative || row_start + count != a.m
+                                 ? -1
+                                 : a.m;
           }
         });
   });
@@ -190,15 +198,19 @@ void launch_dpas_by_active_expert(sycl::queue& queue, const PrefillDown& a) {
 }  // namespace
 
 bool try_prefill_down(sycl::queue& queue, const PrefillDown& a) {
-  if (!queue.is_in_order() || !a.x || !a.w2 || !a.s2 || !a.counts ||
-      !a.output || !a.row_prefix || !a.tile_prefix || a.m < 0 ||
+  if (!queue.is_in_order() || a.m < 0 ||
       a.m > std::numeric_limits<int>::max() - 8192 ||
-      (a.k != 80 && a.k != 160) ||
+      (a.k != 80 && a.k != 160)) {
+    return false;
+  }
+  // Empty tensors legitimately have null pointers; no storage is accessed.
+  if (a.m == 0) return true;
+  if (!a.x || !a.w2 || !a.s2 || !a.counts || !a.output || !a.row_prefix ||
+      !a.tile_prefix ||
       (reinterpret_cast<uintptr_t>(a.x) & 63u) != 0 ||
       (reinterpret_cast<uintptr_t>(a.w2) & 3u) != 0) {
     return false;
   }
-  if (a.m == 0) return true;
   const bool long_prefill = a.m >= 512;
   launch_prefix(queue, a, long_prefill);
   // Long prefill reuses tile_prefix as a compact active-expert list, avoiding

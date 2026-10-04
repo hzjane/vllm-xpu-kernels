@@ -247,3 +247,36 @@ def test_prefill_provider_signed_s4_tail(provider, k):
     expected = torch.tensor([-expected_magnitude] * 3 + [expected_magnitude],
                             dtype=torch.float16)[:, None].expand(4, 2560)
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
+def test_public_out_rejects_independent_dlpack_alias(provider, case):
+    x = case["x"][:4]
+    output = torch.from_dlpack(x)
+    assert output.data_ptr() == x.data_ptr()
+    assert not torch._C._overlaps(x, output)
+    before = x.clone()
+    operation = (provider.compact80_ops()[1] if case["k"] == 80
+                 else provider.compact160_ops()[1])
+    with pytest.raises(RuntimeError, match="contract"):
+        operation(x, case["logits"][:4], *case["weights"], output, 10, 1, 512)
+    torch.testing.assert_close(x, before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("k", (80, 160))
+def test_prefill_empty_and_overflowing_expert_counts(provider, k):
+    packed = torch.full((512, 2560, k // 2), 0x11,
+                        dtype=torch.uint8, device="xpu")
+    scales = torch.ones((512, 2560, (k + 127) // 128),
+                        dtype=torch.float16, device="xpu")
+    counts = torch.zeros(512, dtype=torch.int32, device="xpu")
+    operation = (provider.compact80_ops()[2] if k == 80
+                 else provider.compact160_ops()[2])
+    empty = operation(torch.empty((0, k), dtype=torch.float16, device="xpu"),
+                      packed, scales, counts)
+    assert empty.shape == (0, 2560)
+    # The int32 sum wraps to M=4, although the real total is 2**32+4.
+    counts[:3] = torch.tensor([2147483647, 2147483647, 6],
+                             dtype=torch.int32, device="xpu")
+    output = operation(torch.ones((4, k), dtype=torch.float16, device="xpu"),
+                       packed, scales, counts)
+    assert torch.isnan(output).all().item()

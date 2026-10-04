@@ -361,6 +361,54 @@ def _conv_golden(x, state, weight, slots, initial, starts, accepted, dilation,
     return output, state
 
 
+@pytest.mark.parametrize("trusted", (False, True))
+@pytest.mark.parametrize("mode", ("decode", "prefill", "spec"))
+def test_lazy_state_rejected_without_write(ops, trusted, mode):
+    x = torch.ones((2, 3), dtype=torch.float16, device="xpu")
+    weight = torch.ones((3, 2), dtype=torch.float16, device="xpu")
+    backing = torch.full((3, 3, 6), 7, dtype=torch.float16, device="xpu")
+    state = backing._neg_view()
+    output = torch.full_like(x, 9)
+    slots = _xpu([1, 2], torch.int32)
+    starts = _xpu([0, 1, 2], torch.int32)
+    operation = getattr(ops, "ple_short_conv_" + mode +
+                        ("_trusted" if trusted else ""))
+    null_id = 0 if trusted else -1
+    with pytest.raises(RuntimeError, match="lazy"):
+        if mode == "decode":
+            operation(x, state, weight, slots, _xpu([True, True]),
+                      output, 1, True, null_id)
+        elif mode == "prefill":
+            operation(x, starts, state, weight, slots, _xpu([True, True]),
+                      output, 1, True, null_id)
+        else:
+            operation(x, starts, state, weight, slots, _xpu([1, 1], torch.int32),
+                      output, 3, 1, True, null_id)
+    assert torch.all(backing == 7).item()
+    assert torch.all(output == 9).item()
+
+
+@pytest.mark.parametrize("trusted", (False, True))
+def test_spec_previous_acceptance_exceeds_current_length(ops, trusted):
+    torch.manual_seed(731)
+    x = torch.randn((2, 3), dtype=torch.float16, device="xpu")
+    weight = torch.randn((3, 2), dtype=torch.float16, device="xpu") * 0.1
+    state = torch.randn((3, 3, 6), dtype=torch.float16, device="xpu")
+    null_id = 0 if trusted else -1
+    slots, starts, accepted = [1, null_id], [0, 1, 2], [4, 0]
+    expected, final_state = _conv_golden(
+        x, state, weight, slots, None, starts, accepted, 1, True, null_id,
+        "spec", 3)
+    output = torch.empty_like(x)
+    operation = getattr(ops, "ple_short_conv_spec" +
+                        ("_trusted" if trusted else ""))
+    operation(x, _xpu(starts, torch.int32), state, weight,
+              _xpu(slots, torch.int32), _xpu(accepted, torch.int32), output,
+              3, 1, True, null_id)
+    _assert_half(output, expected)
+    _assert_half(state, final_state)
+
+
 @pytest.mark.parametrize("mode,dim_first,state_dtype", [
     ("decode", True, torch.float16),
     ("decode", False, torch.float32),
@@ -487,23 +535,18 @@ def test_preflight_rejects_without_state_or_output_write(ops):
     torch.testing.assert_close(state.cpu(), torch.full_like(state.cpu(), 7))
     torch.testing.assert_close(output.cpu(), torch.full_like(output.cpu(), 9))
 
-    # The global draft bound is not enough: accepted must fit that request.
-    with pytest.raises(RuntimeError, match="num_accepted_tokens"):
-        ops.ple_short_conv_spec(
-            x,
-            _xpu([0, 1, 2], torch.int32),
-            state,
-            weights,
-            _xpu([1, 2], torch.int32),
-            _xpu([2, 1], torch.int32),
-            output,
-            2,
-            1,
-            True,
-            -1,
-        )
-    torch.testing.assert_close(state.cpu(), torch.full_like(state.cpu(), 7))
-    torch.testing.assert_close(output.cpu(), torch.full_like(output.cpu(), 9))
+    # Acceptance belongs to the previous query and may exceed the new length.
+    expected, expected_state = _conv_golden(
+        x, state, weights, [1, 2], None, [0, 1, 2], [2, 1],
+        1, True, -1, "spec", 2)
+    ops.ple_short_conv_spec(
+        x, _xpu([0, 1, 2], torch.int32), state, weights,
+        _xpu([1, 2], torch.int32), _xpu([2, 1], torch.int32),
+        output, 2, 1, True, -1)
+    _assert_half(output, expected)
+    torch.testing.assert_close(state.cpu(), expected_state, atol=0, rtol=0)
+    state.fill_(7)
+    output.fill_(9)
 
     # A failing spec metadata check must also precede the first state update.
     with pytest.raises(RuntimeError, match="num_accepted_tokens"):

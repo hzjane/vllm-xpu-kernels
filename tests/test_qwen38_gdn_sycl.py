@@ -451,6 +451,31 @@ def test_decode_rejects_output_alias_before_submit(gdn_ops):
     torch.testing.assert_close(gpu["ssm"], before_ssm, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("invalid", ["padded_alias", "scale_overflow",
+                                     "scale_underflow"])
+def test_decode_review_preflight_preserves_state(gdn_ops, invalid):
+    gpu = _xpu(_case(2, 6, 2, spec=False))
+    if invalid == "padded_alias":
+        m, width = gpu["qkvz"].shape
+        base = torch.empty(m, width + 1, dtype=torch.float16, device="xpu")
+        base[:, :width].copy_(gpu["qkvz"])
+        gpu["qkvz"] = base[:, :width]
+        gpu["output"] = base.flatten()[:m * 6 * 128].view(m, 6, 128)
+    else:
+        gpu["scale"] = 1e300 if invalid == "scale_overflow" else 1e-300
+    gpu["output"].fill_(7)
+    before_conv, before_ssm = gpu["conv"].clone(), gpu["ssm"].clone()
+    before_output = gpu["output"].clone()
+    with pytest.raises(RuntimeError, match="overlap|FP32 conversion"):
+        gdn_ops.decode(
+            gpu["qkvz"], gpu["conv"], gpu["weight"], gpu["bias"],
+            gpu["idx"], gpu["a_log"], gpu["dt_bias"], gpu["ba"],
+            gpu["ssm"], gpu["idx"], gpu["output"], gpu["z"], gpu["scale"])
+    torch.testing.assert_close(gpu["conv"], before_conv, rtol=0, atol=0)
+    torch.testing.assert_close(gpu["ssm"], before_ssm, rtol=0, atol=0)
+    torch.testing.assert_close(gpu["output"], before_output, rtol=0, atol=0)
+
+
 def test_decode_nondefault_stream_keeps_dropped_weight(gdn_ops):
     cpu = _case(4, 12, 1, spec=False)
     expected = _reference(cpu, spec=False)

@@ -482,6 +482,7 @@ at::Tensor group_compress_v2(
   TORCH_CHECK(raw_keys.scalar_type() == at::kHalf ||
                   raw_keys.scalar_type() == at::kBFloat16,
               "raw_keys must be FP16 or BF16");
+  check_xpu(raw_keys, raw_keys, raw_keys.scalar_type(), "raw_keys");
   check_xpu(raw_positions, raw_keys, at::kLong, "raw_positions");
   check_xpu(compressor_state_cache, raw_keys, raw_keys.scalar_type(),
             "compressor_state_cache");
@@ -562,6 +563,10 @@ at::Tensor group_compress_v2(
   c10::OptionalDeviceGuard guard(raw_keys.device());
   auto stream = c10::xpu::getCurrentXPUStream(raw_keys.get_device());
   auto& queue = stream.queue();
+  record_tensors({&raw_keys, &raw_positions, &compressor_state_cache,
+                  &rope_position_cache, &compressor_state_block_table,
+                  &token_to_req, &query_start_loc, &logical_positions,
+                  &compressed_slots, &pooled, &first_positions}, stream);
   const auto ring_size = compressor_state_cache.size(1);
   const bool power_of_two = (ring_size & (ring_size - 1)) == 0;
   if (raw_keys.scalar_type() == at::kHalf) {
@@ -591,10 +596,6 @@ at::Tensor group_compress_v2(
         query_start_loc, logical_positions, compressed_slots, pooled,
         first_positions, compressed_capacity);
   }
-  record_tensors({&raw_keys, &raw_positions, &compressor_state_cache,
-                  &rope_position_cache, &compressor_state_block_table,
-                  &token_to_req, &query_start_loc, &logical_positions,
-                  &compressed_slots, &pooled, &first_positions}, stream);
   return pooled;
 }
 
@@ -604,6 +605,7 @@ at::Tensor token_split_attention_v3(
     const at::Tensor& token_to_req, int64_t page_size, at::Tensor output,
     at::Tensor partials) {
   TORCH_CHECK(q.is_xpu(), "q must be XPU");
+  check_xpu(q, q, at::kHalf, "q");
   check_xpu(packed_kv, q, at::kHalf, "packed_kv");
   check_xpu(logical_indices, q, at::kInt, "logical_indices");
   check_xpu(block_table, q, at::kInt, "block_table");
@@ -655,6 +657,10 @@ at::Tensor token_split_attention_v3(
   auto& queue = stream.queue();
   TORCH_CHECK(queue.is_in_order(),
               "attention scratch reuse requires an in-order current stream");
+  // A later phase/chunk can throw after earlier work was submitted. Record
+  // every allocation first so exception unwinding cannot recycle live USM.
+  record_tensors({&q, &packed_kv, &logical_indices, &block_table, &token_to_req,
+                  &output, &partials}, stream);
   const int total_rows = static_cast<int>(q.size(0));
   const int heads = static_cast<int>(q.size(1));
   const int tokens_per_partial = total_rows == 1 ? 64 : 48;
@@ -715,8 +721,6 @@ at::Tensor token_split_attention_v3(
         rows, heads, partial_count);
     has_previous = true;
   }
-  record_tensors({&q, &packed_kv, &logical_indices, &block_table,
-                  &token_to_req, &output, &partials}, stream);
   return output;
 }
 
@@ -1008,6 +1012,7 @@ at::Tensor select_paged_tokens_v2(
     at::Tensor scores_a, at::Tensor indices_a, at::Tensor scores_b,
     at::Tensor indices_b) {
   TORCH_CHECK(q.is_xpu(), "selection query must be on XPU");
+  check_xpu(q, q, at::kHalf, "selection query");
   check_xpu(compressed_key_cache, q, at::kHalf, "compressed_key_cache");
   check_xpu(page_table, q, at::kInt, "page_table");
   check_xpu(token_to_req, q, at::kInt, "token_to_req");
@@ -1089,6 +1094,9 @@ at::Tensor select_paged_tokens_v2(
   auto& queue = stream.queue();
   TORCH_CHECK(queue.is_in_order(),
               "selection scratch reuse requires an in-order current stream");
+  record_tensors({&q, &compressed_key_cache, &page_table, &token_to_req,
+                  &query_positions, &sequence_lengths, &out, &scores_a,
+                  &indices_a, &scores_b, &indices_b}, stream);
   const int partitions = max_seq_len >= 4096 ? kSelectionPartitions : 1;
   const int max_blocks = static_cast<int>((max_seq_len + 3) / 4);
   const int per_partition = (max_blocks + partitions - 1) / partitions;
@@ -1149,9 +1157,6 @@ at::Tensor select_paged_tokens_v2(
     previous = phase;
     has_previous = true;
   }
-  record_tensors({&q, &compressed_key_cache, &page_table, &token_to_req,
-                  &query_positions, &sequence_lengths, &out, &scores_a,
-                  &indices_a, &scores_b, &indices_b}, stream);
   return out;
 }
 

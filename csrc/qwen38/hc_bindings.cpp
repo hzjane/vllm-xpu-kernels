@@ -2,6 +2,8 @@
 #include <ATen/MemoryOverlap.h>
 #include <torch/library.h>
 
+#include <cstdint>
+
 #include "core/registration.h"
 #include "qwen38/hc_sycl.h"
 
@@ -16,6 +18,13 @@ bool hc_outputs_alias_inputs(at::TensorList outputs, at::TensorList inputs) {
       // between separate Storage owners wrapping the same physical memory.
       if (output.is_alias_of(input) ||
           at::get_overlap_status(output, input) != at::MemOverlapStatus::No) {
+        return true;
+      }
+      const auto out_start = reinterpret_cast<uintptr_t>(output.const_data_ptr());
+      const auto in_start = reinterpret_cast<uintptr_t>(input.const_data_ptr());
+      if (out_start <= in_start
+              ? in_start - out_start < output.numel() * output.element_size()
+              : out_start - in_start < input.numel() * input.element_size()) {
         return true;
       }
     }

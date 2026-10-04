@@ -277,9 +277,9 @@ at::Tensor store_cache_rows_v3(at::Tensor cache,
   auto stream = c10::xpu::getCurrentXPUStream(cache.get_device());
   TORCH_CHECK(stream.queue().is_in_order(),
               "row-store requires an in-order current stream");
+  record_tensors({&cache, &slot_mapping, &rows}, stream);
   launch_store_typed(stream.queue(), cache, slot_mapping, rows,
                      unique_slots_proven);
-  record_tensors({&cache, &slot_mapping, &rows}, stream);
   return cache;
 }
 
@@ -294,8 +294,10 @@ bool try_store_m1_transaction_v1(
   // No receipt ABI here: the model defaults it off. Never fall back after
   // one of these submissions, even if a later queue operation throws.
   for (const auto& [cache, slots, rows] : stores) {
-    launch_store_typed(stream.queue(), cache, slots, rows, false);
     record_tensors({&cache, &slots, &rows}, stream);
+  }
+  for (const auto& [cache, slots, rows] : stores) {
+    launch_store_typed(stream.queue(), cache, slots, rows, false);
   }
   return true;
 }
@@ -331,13 +333,13 @@ bool try_store_m1_transaction_fused_v1(const M1Stores& stores) {
         page_shift,
         static_cast<int>(cache.size(3))};
   }
-  launch_store_m1_transaction_fused(
-      stream.queue(), descriptors, static_cast<int>(stores.size()));
-  // Keep all caller-owned USM allocations alive on the submitting stream.
-  // A post-submit failure propagates; the Python caller must not replay.
+  // Record all owners before submitting the transaction; exception unwinding
+  // must not recycle any allocation after a partial submission failure.
   for (const auto& [cache, slots, rows] : stores) {
     record_tensors({&cache, &slots, &rows}, stream);
   }
+  launch_store_m1_transaction_fused(
+      stream.queue(), descriptors, static_cast<int>(stores.size()));
   return true;
 }
 
