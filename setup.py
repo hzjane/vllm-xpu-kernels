@@ -84,7 +84,8 @@ def _is_enabled(env_name: str) -> bool:
 class CMakeExtension(Extension):
 
     def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=True, **kwa)
+        kwa.setdefault("py_limited_api", True)
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -193,8 +194,10 @@ class cmake_build_ext(build_ext):
             "MOE_KERNELS_ENABLED",
             "GDN_KERNELS_ENABLED",
             "MQA_LOGITS_KERNELS_ENABLED",
+            "MHC_KERNELS_ENABLED",
             "XPU_SPECIFIC_KERNELS_ENABLED",
             "XPUMEM_ALLOCATOR_ENABLED",
+            "QWEN38_KERNELS_ENABLED",
         ]
         for opt in _kernel_options:
             cmake_args.append('-D{}={}'.format(
@@ -570,6 +573,9 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
             "/csrc/xpu/grouped_gemm/xe_default")
 
 if _build_custom_ops():
+    if _is_enabled("QWEN38_KERNELS_ENABLED"):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._qwen38_C",
+                                         py_limited_api=False))
     if _is_enabled("BASIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._C"))
     if _is_enabled("FA2_KERNELS_ENABLED"):
