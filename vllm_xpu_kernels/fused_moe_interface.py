@@ -326,6 +326,13 @@ class XpuFusedMoe:
         # and gather. The candidate keeps all three FP16 rounding boundaries.
         if (_FP8_MOE_DECODE is not None and not self._use_ref and self.is_fp8
                 and self.activation == "gelu_tanh"
+                and self.num_experts == 128 and self.n_experts_per_token == 8
+                and self.inter_size == 352
+                and hidden_states.device.type == "xpu"
+                and hidden_states.dtype == torch.float16
+                and hidden_states.ndim == 2
+                and 1 <= hidden_states.shape[0] <= 8
+                and hidden_states.shape[1] == 2816
                 and self.w13_bias is None and self.w2_bias is None
                 and self.ep_size == 1 and self.ep_rank == 0
                 and self.expert_map is None and expert_map is None

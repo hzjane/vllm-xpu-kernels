@@ -230,9 +230,9 @@ std::vector<at::Tensor> mha_varlen_fwd(
   // progressively longer KV prefixes. Build the metadata on the current
   // stream: no host readback, cache copy, or change to vLLM is required.
   const bool small_m_decode =
-      vllm::xpu::is_xe2_arch() && is_paged && is_causal && !is_sink &&
-      !return_softmax && !q_scale.has_value() && p_dropout == 0.0 &&
-      max_seqlen_q >= 2 && max_seqlen_q <= 8 && q.size(0) == max_seqlen_q &&
+      is_paged && is_causal && !is_sink && !return_softmax &&
+      !q_scale.has_value() && p_dropout == 0.0 && max_seqlen_q >= 2 &&
+      max_seqlen_q <= 8 && q.size(0) == max_seqlen_q &&
       cu_seqlens_q.numel() == 2 && seqlens_k.numel() == 1 &&
       q_type == at::kHalf && k_type == at::kHalf &&
       v.scalar_type() == at::kHalf && q.is_contiguous() &&
@@ -249,7 +249,8 @@ std::vector<at::Tensor> mha_varlen_fwd(
        (q.size(2) == 512 && v.size(3) == 512 &&
         (k.size(1) == 64 || k.size(1) == 128) &&
         (q.size(1) == 8 || q.size(1) == 16) && q.size(1) == 8 * k.size(2) &&
-        !is_local));
+        !is_local)) &&
+      vllm::xpu::is_xe2_arch();
   if (small_m_decode) {
     const int tokens = q.size(0), heads = q.size(1), dim = q.size(2);
     const int pages = block_table.size(1);
@@ -502,16 +503,16 @@ std::vector<at::Tensor> mha_varlen_fwd(
     }
 
     const bool use_short_sequence_policy =
-        vllm::xpu::is_xe2_arch() && q_type == at::kHalf &&
-        k_type == at::kHalf && num_tokens == 1 && batch_size == 1 &&
-        max_seqlen_q == 1 && num_heads_q == 16 &&
+        q_type == at::kHalf && k_type == at::kHalf && num_tokens == 1 &&
+        batch_size == 1 && max_seqlen_q == 1 && num_heads_q == 16 &&
         (block_size == 64 || block_size == 128) && !is_sink &&
         !splits_per_seq.has_value() && !work_list.has_value() &&
         ((!is_local && head_size_qk == 512 && v_head_dim == 512 &&
           num_heads_kv == 2) ||
          (is_local && block_size == 64 && head_size_qk == 256 &&
           v_head_dim == 256 && num_heads_kv == 8 && window_size_left == 1023 &&
-          window_size_right == 0));
+          window_size_right == 0)) &&
+        vllm::xpu::is_xe2_arch();
     int num_kv_splits = num_splits.value_or(get_num_splits(
         queue,
         batch_size,
@@ -527,12 +528,13 @@ std::vector<at::Tensor> mha_varlen_fwd(
     // Keep this override within the measured FP16 shape/length range, and
     // preserve explicit split counts and compact per-sequence schedules.
     if (!num_splits.has_value() && !splits_per_seq.has_value() &&
-        !work_list.has_value() && vllm::xpu::is_xe2_arch() &&
-        q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf &&
-        head_size_qk == 512 && v_head_dim == 512 && batch_size == 1 &&
-        max_seqlen_q == 1 && num_heads_q == 16 && num_heads_kv == 2 &&
+        !work_list.has_value() && q.scalar_type() == at::kHalf &&
+        k.scalar_type() == at::kHalf && head_size_qk == 512 &&
+        v_head_dim == 512 && batch_size == 1 && max_seqlen_q == 1 &&
+        num_heads_q == 16 && num_heads_kv == 2 &&
         (block_size == 64 || block_size == 128) && !is_local && !is_sink &&
-        effective_seqlen_k >= 16384 && effective_seqlen_k <= 40960) {
+        effective_seqlen_k >= 16384 && effective_seqlen_k <= 40960 &&
+        vllm::xpu::is_xe2_arch()) {
       num_kv_splits = std::min(num_kv_splits, 16);
     }
 
@@ -540,13 +542,13 @@ std::vector<at::Tensor> mha_varlen_fwd(
     // Four splits provide enough parallel work for the measured B1 GQA2
     // case; eight splits add overhead, while one split underutilizes Xe2.
     if (!num_splits.has_value() && !splits_per_seq.has_value() &&
-        !work_list.has_value() && vllm::xpu::is_xe2_arch() &&
-        q.scalar_type() == at::kHalf && k.scalar_type() == at::kHalf &&
-        head_size_qk == 256 && v_head_dim == 256 && batch_size == 1 &&
-        max_seqlen_q == 1 && num_heads_q == 16 && num_heads_kv == 8 &&
-        block_size == 32 && is_local && !is_sink && eff_window_left == 1023 &&
+        !work_list.has_value() && q.scalar_type() == at::kHalf &&
+        k.scalar_type() == at::kHalf && head_size_qk == 256 &&
+        v_head_dim == 256 && batch_size == 1 && max_seqlen_q == 1 &&
+        num_heads_q == 16 && num_heads_kv == 8 && block_size == 32 &&
+        is_local && !is_sink && eff_window_left == 1023 &&
         eff_window_right == 0 && max_seqlen_k >= 16384 &&
-        max_seqlen_k <= 40960) {
+        max_seqlen_k <= 40960 && vllm::xpu::is_xe2_arch()) {
       num_kv_splits = std::min(num_kv_splits, 4);
     }
 
