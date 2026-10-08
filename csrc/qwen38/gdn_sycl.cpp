@@ -70,14 +70,19 @@ MemoryRows memory_rows(const torch::Tensor& t) {
   if (t.numel() == 0) return {begin, begin, 0, 0, 0};
   const auto item = uintptr_t(t.element_size());
   if (t.is_contiguous())
-    return {begin, begin + uintptr_t(t.numel()) * item,
-            uintptr_t(t.numel()) * item, uintptr_t(t.numel()) * item, 1};
+    return {
+        begin,
+        begin + uintptr_t(t.numel()) * item,
+        uintptr_t(t.numel()) * item,
+        uintptr_t(t.numel()) * item,
+        1};
   // Every accepted non-dense GDN layout has a dense inner row. Conv and SSM
   // live in disjoint regions of each shared KV page, not distinct storages.
   int64_t inner = 1;
   for (int d = int(t.dim()) - 1; d >= 1; --d) {
-    TORCH_CHECK(t.size(d) == 1 || t.stride(d) == inner,
-                "GDN alias check requires dense inner rows");
+    TORCH_CHECK(
+        t.size(d) == 1 || t.stride(d) == inner,
+        "GDN alias check requires dense inner rows");
     inner *= t.size(d);
   }
   TORCH_CHECK(t.stride(0) >= inner, "GDN alias check requires positive pitch");
@@ -85,17 +90,18 @@ MemoryRows memory_rows(const torch::Tensor& t) {
   const auto pitch = uintptr_t(t.stride(0)) * item;
   const auto rows = t.size(0);
   constexpr auto max = std::numeric_limits<uintptr_t>::max();
-  TORCH_CHECK(uintptr_t(rows - 1) <= (max - width) / pitch,
-              "GDN address span overflows");
+  TORCH_CHECK(
+      uintptr_t(rows - 1) <= (max - width) / pitch,
+      "GDN address span overflows");
   const auto span = uintptr_t(rows - 1) * pitch + width;
   TORCH_CHECK(begin <= max - span, "GDN address range overflows");
   return {begin, begin + span, width, pitch, rows};
 }
 
-bool physical_overlap(const torch::Tensor& a, const torch::Tensor& b) {
-  auto left = memory_rows(a), right = memory_rows(b);
+bool physical_overlap(MemoryRows left, MemoryRows right) {
   if (left.rows == 0 || right.rows == 0 || left.end <= right.begin ||
-      right.end <= left.begin) return false;
+      right.end <= left.begin)
+    return false;
   if (left.pitch == right.pitch) {
     // Common KV-page pitch: decide by offset/width in O(1), not by iterating
     // thousands of cache pages on every decode token.
@@ -119,6 +125,10 @@ bool physical_overlap(const torch::Tensor& a, const torch::Tensor& b) {
       return true;
   }
   return false;
+}
+
+bool physical_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  return physical_overlap(memory_rows(a), memory_rows(b));
 }
 
 void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
@@ -535,8 +545,7 @@ constexpr size_t kRootLocalBytes = 3 * kDim * sizeof(float);
 template <class Body>
 struct GdnRootBody {
   Body body;
-  constexpr auto get(
-      sycl::ext::oneapi::experimental::properties_tag) const {
+  constexpr auto get(sycl::ext::oneapi::experimental::properties_tag) const {
     namespace sx = sycl::ext::oneapi::experimental;
     return sx::properties{sx::sub_group_size<kSubgroup>};
   }
@@ -556,9 +565,8 @@ size_t root_kernel_group_limit(sycl::queue& queue) {
   size_t limit = 0;
   try {
     const auto id = sycl::get_kernel_id<GdnDecodeRootKernel>();
-    const auto bundle =
-        sycl::get_kernel_bundle<sycl::bundle_state::executable>(
-            queue.get_context(), {queue.get_device()}, {id});
+    const auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(
+        queue.get_context(), {queue.get_device()}, {id});
     const auto kernel = bundle.get_kernel(id);
     limit = kernel.ext_oneapi_get_info<
         sx::info::kernel_queue_specific::max_num_work_groups>(
@@ -603,8 +611,8 @@ void launch_decode_root(
           const int split = group % kRootSplits;
           const int kh = hv / (s.hv / s.h);
           const int ci = conv_indices[0], si = ssm_indices[0];
-          const bool valid = ci >= 0 && ci < s.conv_slots && si >= 0 &&
-                             si < s.ssm_slots;
+          const bool valid =
+              ci >= 0 && ci < s.conv_slots && si >= 0 && si < s.ssm_slots;
           half* history = valid ? conv + int64_t(ci) * s.conv_stride : nullptr;
           float saved_b[3], saved_c[3], saved_x[3];
 #pragma unroll
@@ -619,8 +627,7 @@ void launch_decode_root(
             const float x = valid ? float(input[f]) : 0.f;
             float value = 0.f;
             if (valid) {
-              value = a * float(weight[4 * f]) +
-                      b * float(weight[4 * f + 1]) +
+              value = a * float(weight[4 * f]) + b * float(weight[4 * f + 1]) +
                       c * float(weight[4 * f + 2]) +
                       x * float(weight[4 * f + 3]) + float(bias[f]);
               value /= 1.f + sycl::exp(-value);
@@ -670,8 +677,10 @@ void launch_decode_root(
             q2 += q[j] * q[j];
             k2 += k[j] * k[j];
           }
-          const float q_inv = s.scale * sycl::rsqrt(
-              sycl::reduce_over_group(sg, q2, sycl::plus<float>()) + 1e-6f);
+          const float q_inv =
+              s.scale *
+              sycl::rsqrt(
+                  sycl::reduce_over_group(sg, q2, sycl::plus<float>()) + 1e-6f);
           const float k_inv = sycl::rsqrt(
               sycl::reduce_over_group(sg, k2, sycl::plus<float>()) + 1e-6f);
 #pragma unroll
@@ -683,8 +692,8 @@ void launch_decode_root(
               -sycl::exp(float(a_log[hv])) *
               softplus(float(ba[s.hv + hv]) + float(dt_bias[hv])));
           const float beta = sigmoid(float(ba[hv]));
-          half* head = state + int64_t(si) * s.ssm_stride +
-                       int64_t(hv) * kDim * kDim;
+          half* head =
+              state + int64_t(si) * s.ssm_stride + int64_t(hv) * kDim * kDim;
           float h[kRootRowsPerSubgroup][kValuesPerLane];
 #pragma unroll
           for (int r = 0; r < kRootRowsPerSubgroup; ++r)
@@ -909,6 +918,40 @@ class GdnNormGateKernel;
 
 }  // namespace
 
+bool tensors_disjoint_host(
+    const std::vector<torch::Tensor>& writes,
+    const std::vector<std::optional<torch::Tensor>>& reads) {
+  struct Entry {
+    c10::Device device;
+    MemoryRows rows;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(writes.size() + reads.size());
+  const auto append = [&](const torch::Tensor& tensor) {
+    if (!tensor.defined() || tensor.layout() != at::kStrided ||
+        tensor.is_meta())
+      return false;
+    entries.push_back({tensor.device(), memory_rows(tensor)});
+    return true;
+  };
+  // All failure handling is confined to metadata inspection. This function
+  // never allocates device storage, submits a kernel, or changes a tensor.
+  try {
+    for (const auto& tensor : writes)
+      if (!append(tensor)) return false;
+    for (const auto& tensor : reads)
+      if (tensor.has_value() && !append(*tensor)) return false;
+  } catch (const c10::Error&) {
+    return false;
+  }
+  for (size_t i = 0; i < writes.size(); ++i)
+    for (size_t j = i + 1; j < entries.size(); ++j)
+      if (entries[i].device == entries[j].device &&
+          physical_overlap(entries[i].rows, entries[j].rows))
+        return false;
+  return true;
+}
+
 void gdn_decode_sycl(
     const torch::Tensor& qkvz,
     torch::Tensor& conv_state,
@@ -947,8 +990,18 @@ void gdn_decode_sycl(
   auto& queue = stream.queue();
   // Preserve ownership even if a later submit fails after conv mutates state.
   record_stream(
-      {&qkvz, &conv_state, &conv_weight, &conv_bias, &conv_indices, &a_log,
-       &dt_bias, &ba, &ssm_state, &ssm_indices, &output, &z},
+      {&qkvz,
+       &conv_state,
+       &conv_weight,
+       &conv_bias,
+       &conv_indices,
+       &a_log,
+       &dt_bias,
+       &ba,
+       &ssm_state,
+       &ssm_indices,
+       &output,
+       &z},
       stream);
   const bool root_eligible =
       s.m == 1 && s.h == 4 && queue.is_in_order() &&
@@ -1078,8 +1131,19 @@ void gdn_spec_v2_sycl(
   auto stream = c10::xpu::getCurrentXPUStream(qkvz.device().index());
   auto& queue = stream.queue();
   record_stream(
-      {&qkvz, &conv_state, &conv_weight, &conv_bias, &spec_indices, &a_log,
-       &dt_bias, &ba, &ssm_state, &output, &z, &token_indices, &accepted},
+      {&qkvz,
+       &conv_state,
+       &conv_weight,
+       &conv_bias,
+       &spec_indices,
+       &a_log,
+       &dt_bias,
+       &ba,
+       &ssm_state,
+       &output,
+       &z,
+       &token_indices,
+       &accepted},
       stream);
   auto qkv = at::empty({m, s.dim}, qkvz.options());
   record_stream({&qkv}, stream);
@@ -1245,8 +1309,7 @@ void gdn_spec_conv_probe_sycl(
           qkvz.size(1) == dim + hv * kDim && conv.is_contiguous() &&
           conv.dim() == 3 && conv.size(0) > 1 &&
           conv.size(0) <= std::numeric_limits<int>::max() &&
-          (conv.size(1) == 3 || conv.size(1) >= m + 2) &&
-          conv.size(2) == dim &&
+          (conv.size(1) == 3 || conv.size(1) >= m + 2) && conv.size(2) == dim &&
           weight.is_contiguous() && weight.dim() == 2 &&
           weight.size(0) == dim && weight.size(1) == 4 &&
           bias.is_contiguous() && bias.numel() == dim && qkv.is_contiguous() &&

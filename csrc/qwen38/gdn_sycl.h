@@ -2,8 +2,16 @@
 #pragma once
 
 #include <torch/types.h>
+#include <optional>
+#include <vector>
 
 namespace vllm::qwen38 {
+
+// Host-only, side-effect-free preflight for dense/paged tensor views. It
+// checks physical addresses even when distinct Storage objects share memory.
+bool tensors_disjoint_host(
+    const std::vector<torch::Tensor>& writes,
+    const std::vector<std::optional<torch::Tensor>>& reads);
 
 // Sequential [q|k|v|z] layout. TP4 is H=4, HV=12, K=V=128;
 // TP8 (H=2, HV=6) uses the same mapping. All outputs are caller-owned.

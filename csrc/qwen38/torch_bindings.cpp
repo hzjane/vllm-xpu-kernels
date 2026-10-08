@@ -6,6 +6,8 @@
 #include <memory>
 
 #include "core/registration.h"
+#include "qwen38/gdn_sycl.h"
+#include "qwen38/gdn_sycl_workspace.h"
 #include "qwen38/hc_sycl_workspace.h"
 #include "qwen38/ngram.h"
 #include "qwen38/moe_sycl_workspace.h"
@@ -13,6 +15,7 @@
 #include "qwen38/qsa_sycl.h"
 #include "qwen38/qsa_sycl_aux.h"
 #include "qwen38/qsa_sycl_owner.h"
+#include "qwen38/tensor_binding.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def(
@@ -66,6 +69,15 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   namespace py = pybind11;
+  module.def("tensors_disjoint_host", &vllm::qwen38::tensors_disjoint_host);
+  py::class_<vllm::qwen38::GdnSyclM1Workspace>(module, "GDNM1WorkspaceDirectV1")
+      .def(py::init<>())
+      .def("try_run", &vllm::qwen38::GdnSyclM1Workspace::try_run)
+      .def("invalidate", &vllm::qwen38::GdnSyclM1Workspace::invalidate);
+  py::class_<vllm::qwen38::TensorBindingSnapshotV1>(
+      module, "TensorBindingSnapshotV1")
+      .def(py::init<const std::vector<torch::Tensor>&>())
+      .def("matches", &vllm::qwen38::TensorBindingSnapshotV1::matches);
   using vllm::qwen38::hc::HcSyclM1Workspace;
   using vllm::qwen38::hc::HcSyclMultiMWorkspace;
   py::class_<HcSyclM1Workspace, std::shared_ptr<HcSyclM1Workspace>>(
@@ -81,8 +93,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   vllm::qwen38::moe_sycl::bind_moe_sycl_workspace(module);
   module.attr("qsa_sycl_selection_wide_scratch_abi_version") = 1;
   module.def("group_compress_v2", &vllm::qwen38::qsa_sycl::group_compress_v2);
-  module.def("select_paged_tokens_v2", &vllm::qwen38::qsa_sycl::select_paged_tokens_v2);
-  module.def("token_split_attention_v3", &vllm::qwen38::qsa_sycl::token_split_attention_v3);
+  module.def(
+      "select_paged_tokens_v2",
+      &vllm::qwen38::qsa_sycl::select_paged_tokens_v2);
+  module.def(
+      "token_split_attention_v3",
+      &vllm::qwen38::qsa_sycl::token_split_attention_v3);
   vllm::qwen38::qsa_sycl::bind_qsa_sycl_aux(module);
   vllm::qwen38::qsa_sycl::bind_qsa_sycl_owner(module);
 }
