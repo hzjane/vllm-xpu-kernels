@@ -4,6 +4,7 @@
 #include <pybind11/stl.h>
 
 #include <memory>
+#include <vector>
 
 #include "core/registration.h"
 #include "qwen38/gdn_sycl.h"
@@ -16,6 +17,17 @@
 #include "qwen38/qsa_sycl_aux.h"
 #include "qwen38/qsa_sycl_owner.h"
 #include "qwen38/tensor_binding.h"
+
+namespace {
+bool direct_tensor_flags_host(const std::vector<at::Tensor>& tensors) {
+  for (const auto& tensor : tensors) {
+    if (!tensor.defined() || tensor.is_conj() || tensor.is_neg()) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def(
@@ -69,6 +81,7 @@ TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, Conjugate, m) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   namespace py = pybind11;
+  module.def("direct_tensor_flags_host", &direct_tensor_flags_host);
   module.def("tensors_disjoint_host", &vllm::qwen38::tensors_disjoint_host);
   py::class_<vllm::qwen38::GdnSyclM1Workspace>(module, "GDNM1WorkspaceDirectV1")
       .def(py::init<>())

@@ -493,6 +493,23 @@ def selection_golden(case):
     return out
 
 
+@pytest.mark.parametrize("rows", [1, 2, 33])
+@pytest.mark.parametrize("tile", [64, 128])
+def test_m1_attention_merge_tile_preserves_bits_and_batch_tail(native,
+                                                              monkeypatch,
+                                                              rows, tile):
+    case = attention_case(rows, 6, 1024, 512)
+    partials = torch.empty(rows, 6, 43, 258, dtype=torch.float32, device="xpu")
+    baseline, actual = torch.empty_like(case[0]), torch.empty_like(case[0])
+    monkeypatch.setenv("VLLM_XPU_QWEN38_QSA_M1_MERGE_TILE", "256")
+    native.token_split_attention_v3(*case, 512, baseline, partials)
+    monkeypatch.setenv("VLLM_XPU_QWEN38_QSA_M1_MERGE_TILE", str(tile))
+    native.token_split_attention_v3(*case, 512, actual, partials)
+    torch.testing.assert_close(actual, baseline, atol=0, rtol=0)
+
+
+
+
 def assert_random_selection_membership_and_tail(actual, expected):
     """随机近 tie 不强求不同 FP32 归约树的 block 内部次序。"""
     assert actual.shape == expected.shape
