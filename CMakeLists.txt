@@ -71,6 +71,8 @@ option(FA2_KERNELS_ENABLED
        "Build Flash Attention 2 kernels (_vllm_fa2_C extension)" ON)
 option(MOE_KERNELS_ENABLED
        "Build MoE kernels (_moe_C extension + grouped_gemm TLA)" ON)
+option(FP16_LINEAR_KERNELS_ENABLED
+       "Build small-M FP16 Router (_fp16_C extension)" ON)
 option(GDN_KERNELS_ENABLED "Build GDN attention kernels (gdn_attn TLA)" ON)
 option(MQA_LOGITS_KERNELS_ENABLED "Build MQA logits kernels" ON)
 option(MHC_KERNELS_ENABLED
@@ -673,6 +675,18 @@ endif()
 #
 # xpu only ops/kernels, implemented with cutlass/onednn/sycl.
 #
+if(FP16_LINEAR_KERNELS_ENABLED
+   AND BUILD_SYCL_TLA_KERNELS
+   AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/fp16_linear/CMakeLists.txt)
+endif()
+
+if(MOE_KERNELS_ENABLED
+   AND BUILD_SYCL_TLA_KERNELS
+   AND VLLM_XPU_ENABLE_XE2)
+  include(csrc/xpu/moe_decode/CMakeLists.txt)
+endif()
+
 if(XPU_SPECIFIC_KERNELS_ENABLED)
   message(STATUS "Enabling _xpu_C extension.")
 
