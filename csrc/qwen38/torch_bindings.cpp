@@ -74,6 +74,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
       .def(py::init<>())
       .def("try_run", &vllm::qwen38::GdnSyclM1Workspace::try_run)
       .def("invalidate", &vllm::qwen38::GdnSyclM1Workspace::invalidate);
+  py::class_<vllm::qwen38::GdnSyclSpecWorkspace>(
+      module, "GDNSpecWorkspaceDirectV1")
+      .def(py::init<>())
+      .def("try_run", &vllm::qwen38::GdnSyclSpecWorkspace::try_run)
+      .def("invalidate", &vllm::qwen38::GdnSyclSpecWorkspace::invalidate);
   py::class_<vllm::qwen38::TensorBindingSnapshotV1>(
       module, "TensorBindingSnapshotV1")
       .def(py::init<const std::vector<torch::Tensor>&>())
