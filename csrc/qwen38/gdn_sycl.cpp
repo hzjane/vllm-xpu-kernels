@@ -4,6 +4,7 @@
 #include <ATen/MemoryOverlap.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUCachingAllocator.h>
+#include <c10/xpu/XPUGraphsC10Utils.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 #include <sycl/ext/oneapi/experimental/root_group.hpp>
@@ -1003,8 +1004,11 @@ void gdn_decode_sycl(
        &output,
        &z},
       stream);
+  // 当前 UR graph 无法 finalize use_root_sync；capture 保留两阶段数学路径。
   const bool root_eligible =
       s.m == 1 && s.h == 4 && queue.is_in_order() &&
+      c10::xpu::currentStreamCaptureStatusMayInitCtx() !=
+          c10::xpu::CaptureStatus::Recording &&
       (reinterpret_cast<uintptr_t>(ssm_state.data_ptr()) & 3U) == 0 &&
       (s.ssm_stride & 1) == 0;
   if (root_eligible &&

@@ -319,6 +319,39 @@ def test_attention_golden_and_final_esimd(native, rows, heads, length,
                                rtol=0.004)
 
 
+def test_attention_full_graph_replays_overallocated_page_table(native):
+    # 页表容量由最长上下文决定，不能要求它小于 profiling 的物理 cache。
+    q = torch.zeros((1, 6, 256), dtype=torch.float16, device="xpu")
+    packed = torch.zeros((1, 1, 256, 512), dtype=torch.float16, device="xpu")
+    indices = torch.full((1, 2051), -1, dtype=torch.int32, device="xpu")
+    table = torch.tensor([[0, 2, -1, 0]], dtype=torch.int32, device="xpu")
+    requests = torch.zeros(1, dtype=torch.int32, device="xpu")
+    output = torch.empty_like(q)
+    partials = torch.empty((1, 6, 43, 258), dtype=torch.float32, device="xpu")
+
+    def run():
+        native.token_split_attention_v3(q, packed, indices, table, requests,
+                                         256, output, partials)
+
+    run()
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        run()
+    for value in (1, 3):
+        packed[..., 256:].fill_(value)
+        indices.fill_(-1)
+        indices[0, :3].copy_(torch.tensor([0, 256, 512], dtype=torch.int32,
+                                         device="xpu"))
+        graph.replay()
+        torch.testing.assert_close(output.cpu(),
+                                   torch.full_like(output.cpu(), value),
+                                   atol=0, rtol=0)
+    indices.fill_(-1)
+    graph.replay()
+    assert torch.equal(output.cpu(), torch.zeros_like(output.cpu()))
+
+
 @pytest.mark.parametrize("rows", [129, 256])
 def test_attention_prefill_cpp_chunk_owner(native, rows):
     case = attention_case(rows, 6, 1024, 256)

@@ -6,9 +6,9 @@ QWEN38_GDN_STANDALONE_TEST. Set QWEN38_GDN_SYCL_LIBRARY to run XPU tests.
 No ESIMD implementation is used as the mathematical oracle.
 """
 
+import gc
 import math
 import os
-import gc
 from types import SimpleNamespace
 
 import pytest
@@ -233,6 +233,40 @@ def test_decode_unaligned_storage_offset(gdn_ops):
 
 
 @pytest.mark.parametrize("h,hv", [(4, 12), (2, 6)])
+def test_decode_full_graph_updates_current_slot_and_inputs(gdn_ops, h, hv):
+    cpu = _case(h, hv, 1, spec=False)
+    gpu = _xpu(cpu)
+    gpu["idx"].fill_(-1)
+
+    def run():
+        gdn_ops.decode(
+            gpu["qkvz"], gpu["conv"], gpu["weight"], gpu["bias"],
+            gpu["idx"], gpu["a_log"], gpu["dt_bias"], gpu["ba"],
+            gpu["ssm"], gpu["idx"], gpu["output"], gpu["z"], gpu["scale"],
+        )
+
+    run()
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        run()
+    # 捕获期间只用无效 slot，不污染任何真实 recurrent 历史。
+    torch.testing.assert_close(gpu["conv"].cpu(), cpu["conv"], atol=0, rtol=0)
+    torch.testing.assert_close(gpu["ssm"].cpu(), cpu["ssm"], atol=0, rtol=0)
+    for slot in (2, 5, 2):
+        cpu["idx"].fill_(slot)
+        cpu["qkvz"].add_(0.01)
+        gpu["idx"].copy_(cpu["idx"])
+        gpu["qkvz"].copy_(cpu["qkvz"])
+        expected = _reference(cpu, spec=False)
+        graph.replay()
+        for key, want in zip(("output", "z", "conv", "ssm"), expected):
+            torch.testing.assert_close(gpu[key].cpu(), want,
+                                       atol=0.006, rtol=0.006)
+        cpu["conv"], cpu["ssm"] = expected[2:]
+
+
+@pytest.mark.parametrize("h,hv", [(4, 12), (2, 6)])
 @pytest.mark.parametrize("m", range(2, 9))
 @pytest.mark.parametrize("packed", [True, False])
 def test_spec_v2_golden(gdn_ops, h, hv, m, packed):
@@ -275,7 +309,8 @@ def test_shared_kv_pages_disjoint_conv_and_ssm(gdn_ops, spec, separate_storage):
     backing = torch.full((rows, conv_width + ssm_width + 8), -19,
                          dtype=torch.float16, device="xpu")
     gpu["conv"] = backing[:, :conv_width].view_as(gpu["conv"])
-    gpu["ssm"] = backing[:, conv_width:conv_width + ssm_width].view_as(gpu["ssm"])
+    gpu["ssm"] = backing[:, conv_width:conv_width + ssm_width].view_as(
+        gpu["ssm"])
     if separate_storage:
         gpu["conv"] = torch.from_dlpack(gpu["conv"])
         gpu["ssm"] = torch.from_dlpack(gpu["ssm"])
@@ -289,7 +324,8 @@ def test_shared_kv_pages_disjoint_conv_and_ssm(gdn_ops, spec, separate_storage):
         gdn_ops.spec_v2(*common, gpu["output"], gpu["z"], gpu["token_idx"],
                         gpu["accepted"], 1, 4, gpu["scale"])
     else:
-        gdn_ops.decode(*common, gpu["idx"], gpu["output"], gpu["z"], gpu["scale"])
+        gdn_ops.decode(*common, gpu["idx"], gpu["output"], gpu["z"],
+                       gpu["scale"])
     for key, want in zip(("output", "z", "conv", "ssm"), expected):
         torch.testing.assert_close(gpu[key].cpu(), want, atol=0.008, rtol=0.008)
     assert torch.all(backing[:, -8:] == -19).item()

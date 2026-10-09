@@ -769,10 +769,12 @@ at::Tensor token_split_attention_v3(
       logical_indices.sizes() == at::IntArrayRef({q.size(0), kSlots}) &&
           logical_indices.is_contiguous(),
       "logical_indices must be contiguous [M,2051]");
+  // 页表是最长上下文的预分配容量；设备端另行校验实际物理页号。
   TORCH_CHECK(
       block_table.dim() == 2 && block_table.size(0) >= 1 &&
           block_table.size(1) >= 1 &&
-          block_table.size(1) <= packed_kv.size(0) &&
+          block_table.size(0) <=
+              std::numeric_limits<int32_t>::max() / block_table.size(1) &&
           block_table.is_contiguous(),
       "block_table must be contiguous [requests,pages]");
   TORCH_CHECK(
