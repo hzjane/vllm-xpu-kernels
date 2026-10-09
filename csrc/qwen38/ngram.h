@@ -11,6 +11,13 @@ void ngram_decode_ids(
     const at::Tensor& multipliers,
     at::Tensor& output);
 
+void ngram_decode_ids_eos(
+    const at::Tensor& input_ids,
+    const at::Tensor& context,
+    const at::Tensor& multipliers,
+    at::Tensor& output,
+    int64_t eos_token_id);
+
 at::Tensor ngram_host_lookup(
     const at::Tensor& weight,
     const at::Tensor& ids,

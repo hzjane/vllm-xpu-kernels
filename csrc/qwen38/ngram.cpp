@@ -89,7 +89,8 @@ void check_device(
 void check_no_alias(const at::Tensor& output, const at::Tensor& input) {
   if (output.numel() == 0 || input.numel() == 0) return;
   at::assert_no_overlap(output, input);
-  const auto output_begin = reinterpret_cast<uintptr_t>(output.const_data_ptr());
+  const auto output_begin =
+      reinterpret_cast<uintptr_t>(output.const_data_ptr());
   const auto input_begin = reinterpret_cast<uintptr_t>(input.const_data_ptr());
   const bool overlap = output_begin >= input_begin
                            ? output_begin - input_begin < input.nbytes()
@@ -101,16 +102,19 @@ void record_xpu(const at::Tensor& t, c10::xpu::XPUStream stream) {
   c10::xpu::XPUCachingAllocator::recordStream(t.storage().data_ptr(), stream);
 }
 
+template <bool ResetEos>
 class NGramDecodeIdsKernel;
 class NGramHostLookupKernel;
 
 }  // namespace
 
-void ngram_decode_ids(
+template <bool ResetEos>
+static void ngram_decode_ids_impl(
     const at::Tensor& input_ids,
     const at::Tensor& context,
     const at::Tensor& multipliers,
-    at::Tensor& output) {
+    at::Tensor& output,
+    int64_t eos_token_id) {
   TORCH_CHECK(input_ids.is_xpu(), "input_ids must be on XPU");
   const std::array<const at::Tensor*, 4> tensors{
       &input_ids, &context, &multipliers, &output};
@@ -144,14 +148,23 @@ void ngram_decode_ids(
   const auto* mult =
       reinterpret_cast<const uint64_t*>(multipliers.data_ptr<int64_t>());
   auto* out = output.data_ptr<int64_t>();
-  stream.queue().parallel_for<NGramDecodeIdsKernel>(
+  const auto eos = static_cast<uint64_t>(eos_token_id);
+  stream.queue().parallel_for<NGramDecodeIdsKernel<ResetEos>>(
       sycl::nd_range<1>(size_t(m) * 16, 16),
       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(16)]] {
         const int64_t row = item.get_group_linear_id();
         const int head = item.get_local_linear_id();
-        uint64_t mixed =
-            (input[row] * mult[0]) ^ (history[row * 2 + 1] * mult[1]);
-        if (head >= 8) mixed ^= history[row * 2] * mult[2];
+        const uint64_t current = input[row];
+        uint64_t previous = history[row * 2 + 1];
+        uint64_t previous_2 = history[row * 2];
+        if constexpr (ResetEos) {
+          // 当前 EOS 清空全部历史；前一 token 为 EOS 则截断更早历史。
+          const bool reset = current == eos;
+          previous_2 = reset || previous == eos ? eos : previous_2;
+          previous = reset ? eos : previous;
+        }
+        uint64_t mixed = (current * mult[0]) ^ (previous * mult[1]);
+        if (head >= 8) mixed ^= previous_2 * mult[2];
         const bool negative = (mixed >> 63) != 0;
         const uint64_t magnitude = negative ? uint64_t(0) - mixed : mixed;
         uint64_t quotient = sycl::mul_hi(magnitude, kMagic[head]);
@@ -161,6 +174,24 @@ void ngram_decode_ids(
           remainder = kVocabulary[head] - remainder;
         out[row * 16 + head] = remainder + kOffsets[head];
       });
+}
+
+void ngram_decode_ids(
+    const at::Tensor& input_ids,
+    const at::Tensor& context,
+    const at::Tensor& multipliers,
+    at::Tensor& output) {
+  ngram_decode_ids_impl<false>(input_ids, context, multipliers, output, 0);
+}
+
+void ngram_decode_ids_eos(
+    const at::Tensor& input_ids,
+    const at::Tensor& context,
+    const at::Tensor& multipliers,
+    at::Tensor& output,
+    int64_t eos_token_id) {
+  ngram_decode_ids_impl<true>(
+      input_ids, context, multipliers, output, eos_token_id);
 }
 
 at::Tensor ngram_host_lookup_chunked(
