@@ -185,6 +185,7 @@ class cmake_build_ext(build_ext):
         # Forward kernel build options to cmake so option() defaults are
         # overridden when the user sets environment variables.
         _kernel_options = [
+            "GEMMA_COMPILE_KERNELS_ENABLED",
             "BUILD_SYCL_TLA_KERNELS",
             "VLLM_XPU_ENABLE_XE2",
             "VLLM_XPU_ENABLE_XE_DEFAULT",
@@ -582,6 +583,8 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
             "/csrc/xpu/grouped_gemm/xe_default")
 
 if _build_custom_ops():
+    if _is_enabled("GEMMA_COMPILE_KERNELS_ENABLED"):
+        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._gemma_compile_C"))
     if _is_enabled("BASIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._C"))
     if _is_enabled("FA2_KERNELS_ENABLED"):
