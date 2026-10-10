@@ -51,15 +51,18 @@ inline int signed_high(std::uint8_t packed) {
   return nibble < 8 ? nibble : nibble - 16;
 }
 
+template <int Vec>
 class RouterBlockKernel;
 template <int I>
 class UpBlockKernel;
-template <int I, int Tile, int SG>
+template <int I, int Tile, int SG, bool Prefetch>
 class DownBlockKernel;
 
+template <int Vec = 4>
 inline void launch_router(sycl::queue& queue, Inputs p, Workspace w) {
+  static_assert(Vec == 4 || Vec == 8);
   constexpr int subgroups = kWG / kSG;
-  queue.parallel_for<RouterBlockKernel>(
+  queue.parallel_for<RouterBlockKernel<Vec>>(
       sycl::nd_range<1>((p.m * kE / subgroups) * kWG, kWG),
       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSG)]] {
         const int task = item.get_global_linear_id() / kSG;
@@ -72,16 +75,17 @@ inline void launch_router(sycl::queue& queue, Inputs p, Workspace w) {
             reinterpret_cast<const std::uint32_t*>(p.x + token * kH);
         const auto* weight = p.router_weight + std::size_t(expert) * (kH / 2);
         const auto* scale = p.router_scale + expert * 20;
-        for (int g = 0; g < 20; ++g) {
-          const auto x = load<std::uint32_t, 4>(group, input + g * 64);
-          const auto q = load<std::uint8_t, 4>(group, weight + g * 64);
-          const float d = float(scale[g]);
+        for (int g = 0; g < 80 / Vec; ++g) {
+          const auto x = load<std::uint32_t, Vec>(group, input + g * Vec * kSG);
+          const auto q = load<std::uint8_t, Vec>(group, weight + g * Vec * kSG);
 #pragma unroll
-          for (int i = 0; i < 4; ++i) {
+          for (int i = 0; i < Vec; ++i) {
+            const float d = float(scale[g * (Vec / 4) + i / 4]);
             const float we = (int(q[i] & 15) - 8) * d;
             const float wo = (int(q[i] >> 4) - 8) * d;
-            accum[i] = sycl::fma(low_half(x[i]), we, accum[i]);
-            accum[i] = sycl::fma(high_half(x[i]), wo, accum[i]);
+            // 仍为四路累加器，按原20个scale组的顺序FMA，不能改为Vec路。
+            accum[i % 4] = sycl::fma(low_half(x[i]), we, accum[i % 4]);
+            accum[i % 4] = sycl::fma(high_half(x[i]), wo, accum[i % 4]);
           }
         }
         float sum = 0.0f;
@@ -198,7 +202,7 @@ inline void launch_up(sycl::queue& queue, Inputs p, Workspace w) {
       });
 }
 
-template <int I, int Tile = 8, int SG = 16>
+template <int I, int Tile = 8, int SG = 16, bool Prefetch = false>
 inline void launch_down(sycl::queue& queue, Inputs p, Workspace w) {
   constexpr int tile = Tile;
   constexpr int subgroups = 12;
@@ -208,7 +212,7 @@ inline void launch_down(sycl::queue& queue, Inputs p, Workspace w) {
   constexpr int tiles = kH / tile;
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> partial(sycl::range<1>(12 * tile), cgh);
-    cgh.parallel_for<DownBlockKernel<I, Tile, SG>>(
+    cgh.parallel_for<DownBlockKernel<I, Tile, SG, Prefetch>>(
         sycl::nd_range<1>(std::size_t(p.m) * tiles * local, local),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SG)]] {
           const int lane = item.get_local_linear_id() % SG;
@@ -230,8 +234,13 @@ inline void launch_down(sycl::queue& queue, Inputs p, Workspace w) {
               tail_x = reinterpret_cast<const std::uint32_t*>(
                   input)[(I == 160 ? 64 : 32) + lane];
             }
-#pragma unroll
-            for (int h = 0; h < tile; ++h) {
+            struct RoutedRow {
+              sycl::vec<std::uint8_t, head_vec> q;
+              std::uint8_t tail;
+              float d0;
+              float d1;
+            };
+            const auto fetch = [&](int h) {
               const std::size_t row = std::size_t(expert) * kH + hbase + h;
               const auto* weight = p.w2 + row * (I / 2);
               const auto q0 = load<std::uint8_t, head_vec>(group, weight);
@@ -242,6 +251,20 @@ inline void launch_down(sycl::queue& queue, Inputs p, Workspace w) {
                 tail_q = weight[(I == 160 ? 64 : 32) + lane];
               const float d0 = float(p.s2[row * ((I + 127) / 128)]);
               const float d1 = I == 160 ? float(p.s2[row * 2 + 1]) : d0;
+              return RoutedRow{q0, tail_q, d0, d1};
+            };
+            RoutedRow next;
+            if constexpr (Prefetch) next = fetch(0);
+#pragma unroll
+            for (int h = 0; h < tile; ++h) {
+              const RoutedRow data = Prefetch ? next : fetch(h);
+              // 提前发出下一行的读取，不增加tile、不改变当前行累加顺序。
+              if constexpr (Prefetch)
+                if (h + 1 < tile) next = fetch(h + 1);
+              const auto q0 = data.q;
+              const auto tail_q = data.tail;
+              const auto d0 = data.d0;
+              const auto d1 = data.d1;
               float acc[head_vec] = {};
 #pragma unroll
               for (int i = 0; i < head_vec; ++i) {

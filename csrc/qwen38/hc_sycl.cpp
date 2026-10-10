@@ -13,7 +13,10 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <initializer_list>
+#include <type_traits>
 
 namespace vllm::qwen38::hc {
 namespace {
@@ -28,6 +31,7 @@ constexpr int kDownMerged = 336;
 constexpr int kSg = 16;
 constexpr int kLocal = 256;
 constexpr int kNormLocal = 512;
+constexpr int kPrefillMaxM = 4096;
 constexpr auto kLoadProperties = sx::properties{
     sx::data_placement_striped,
     sx::contiguous_memory,
@@ -44,19 +48,22 @@ void check_no_overlap(const torch::Tensor& a, const torch::Tensor& b) {
       padded ? a.storage().data() : a.const_data_ptr());
   const auto b_start = reinterpret_cast<uintptr_t>(
       padded ? b.storage().data() : b.const_data_ptr());
-  const auto a_bytes = padded ? a.storage().nbytes() : a.numel() * a.element_size();
-  const auto b_bytes = padded ? b.storage().nbytes() : b.numel() * b.element_size();
+  const auto a_bytes =
+      padded ? a.storage().nbytes() : a.numel() * a.element_size();
+  const auto b_bytes =
+      padded ? b.storage().nbytes() : b.numel() * b.element_size();
   TORCH_CHECK(
       a_start <= b_start ? b_start - a_start >= a_bytes
                          : a_start - b_start >= b_bytes,
       "HC tensors have overlapping storage or unprovable overlap");
 }
 
-void check_input(const torch::Tensor& input, int width, const char* name) {
+void check_input(
+    const torch::Tensor& input, int width, const char* name, int max_m = 8) {
   TORCH_CHECK(input.is_xpu(), name, " must be on XPU");
   TORCH_CHECK(input.scalar_type() == at::kHalf, name, " must be FP16");
   TORCH_CHECK(
-      input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= 8 &&
+      input.dim() == 2 && input.size(0) >= 1 && input.size(0) <= max_m &&
           input.size(1) == width && input.is_contiguous() && !input.is_neg() &&
           !input.is_conj(),
       name,
@@ -88,8 +95,9 @@ void check_norm(
     const torch::Tensor& input,
     const torch::Tensor& weight,
     const torch::Tensor& output,
-    double eps) {
-  check_input(input, kWidth, "input");
+    double eps,
+    int max_m = 8) {
+  check_input(input, kWidth, "input", max_m);
   check_same(weight, input, "norm weight");
   TORCH_CHECK(
       weight.dim() == 1 && weight.numel() == kWidth && weight.is_contiguous(),
@@ -107,8 +115,9 @@ void check_norm(
 void check_gate(
     const torch::Tensor& input,
     const torch::Tensor& gate,
-    const torch::Tensor& output) {
-  check_input(input, kWidth, "input");
+    const torch::Tensor& output,
+    int max_m = 8) {
+  check_input(input, kWidth, "input", max_m);
   check_matrix(gate, input, input.size(0), kWidth, "gate");
   check_matrix(output, input, input.size(0), kHidden, "mixed output");
   check_no_overlap(output, input);
@@ -119,8 +128,9 @@ void check_combine(
     const torch::Tensor& hidden,
     const torch::Tensor& block,
     const torch::Tensor& injection,
-    const torch::Tensor& output) {
-  check_input(hidden, kWidth, "hidden");
+    const torch::Tensor& output,
+    int max_m = 8) {
+  check_input(hidden, kWidth, "hidden", max_m);
   check_matrix(block, hidden, hidden.size(0), kHidden, "block");
   check_same(injection, hidden, "injection");
   TORCH_CHECK(
@@ -243,9 +253,11 @@ inline float sigmoid(float value) { return 1.0f / (1.0f + sycl::exp(-value)); }
 
 template <bool WithCombine>
 class NormKernel;
-
 template <bool WithCombine>
-void launch_norm(
+class PrefillNorm256Kernel;
+
+template <bool WithCombine, int NormLocal>
+void launch_norm_generic(
     sycl::queue& queue,
     const half* hidden,
     const half* block,
@@ -256,23 +268,17 @@ void launch_norm(
     half* normed,
     int m,
     float eps) {
-  if constexpr (WithCombine) {
-    if (m == 1) {
-      manual_norm::launch(
-          queue, hidden, block, injection, injection_stride, weight,
-          combined, normed, eps);
-      return;
-    }
-    if (manual_norm::launch_small_m(
-            queue, hidden, block, injection, injection_stride, weight,
-            combined, normed, m, eps)) {
-      return;
-    }
-  }
+  static_assert(NormLocal == 256 || NormLocal == 512);
+  static_assert(kHidden % NormLocal == 0);
+  constexpr int subgroups = NormLocal / kSg;
+  using Kernel = std::conditional_t<
+      NormLocal == kNormLocal,
+      NormKernel<WithCombine>,
+      PrefillNorm256Kernel<WithCombine>>;
   queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> partial(kNormLocal / kSg + 1, cgh);
-    cgh.parallel_for<NormKernel<WithCombine>>(
-        sycl::nd_range<1>(size_t(m * kStreams * kNormLocal), kNormLocal),
+    sycl::local_accessor<float, 1> partial(subgroups + 1, cgh);
+    cgh.parallel_for<Kernel>(
+        sycl::nd_range<1>(size_t(m * kStreams * NormLocal), NormLocal),
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSg)]] {
           const int group = item.get_group_linear_id();
           const int row = group / kStreams;
@@ -289,11 +295,11 @@ void launch_norm(
                             float(injection[row * injection_stride + branch]) *
                             0.25f)
                   : 0.0f;
-          half rounded[kHidden / kNormLocal];
+          half rounded[kHidden / NormLocal];
           float sum_sq = 0.0f;
 #pragma unroll
-          for (int i = 0; i < kHidden / kNormLocal; ++i) {
-            const int col = lane + i * kNormLocal;
+          for (int i = 0; i < kHidden / NormLocal; ++i) {
+            const int col = lane + i * NormLocal;
             const float h = float(hidden[offset + col]);
             const float b =
                 WithCombine ? float(block[row * kHidden + col]) : 0.0f;
@@ -312,19 +318,92 @@ void launch_norm(
               sycl::reduce_over_group(sg, sum_sq, sycl::plus<float>());
           if (subgroup_lane == 0) partial[subgroup] = sg_sum;
           item.barrier(sycl::access::fence_space::local_space);
-          const float pair =
-              partial[subgroup_lane] + partial[subgroup_lane + kSg];
+          // WG256仅16个SG；WG512保持原来的两段partial相加顺序。
+          float pair = partial[subgroup_lane];
+          if constexpr (subgroups == 2 * kSg)
+            pair += partial[subgroup_lane + kSg];
           const float total =
               sycl::reduce_over_group(sg, pair, sycl::plus<float>());
           const float inv = sycl::rsqrt(total / float(kHidden) + eps);
 #pragma unroll
-          for (int i = 0; i < kHidden / kNormLocal; ++i) {
-            const int col = lane + i * kNormLocal;
+          for (int i = 0; i < kHidden / NormLocal; ++i) {
+            const int col = lane + i * NormLocal;
             const float w = float(weight[branch * kHidden + col]);
             normed[offset + col] = half(float(rounded[i]) * inv * (1.0f + w));
           }
         });
   });
+}
+
+template <bool WithCombine>
+void launch_norm(
+    sycl::queue& queue,
+    const half* hidden,
+    const half* block,
+    const half* injection,
+    int64_t injection_stride,
+    const half* weight,
+    half* combined,
+    half* normed,
+    int m,
+    float eps) {
+  if constexpr (WithCombine) {
+    if (m == 1) {
+      manual_norm::launch(
+          queue,
+          hidden,
+          block,
+          injection,
+          injection_stride,
+          weight,
+          combined,
+          normed,
+          eps);
+      return;
+    }
+    if (manual_norm::launch_small_m(
+            queue,
+            hidden,
+            block,
+            injection,
+            injection_stride,
+            weight,
+            combined,
+            normed,
+            m,
+            eps)) {
+      return;
+    }
+  }
+  // combine+norm大M默认256；单独norm和旧small-M/manual仍默认512。
+  if (m >= 9) {
+    const char* local = std::getenv("QWEN38_HC_PREFILL_NORM_LOCAL");
+    if ((!local && WithCombine) || (local && std::strcmp(local, "256") == 0)) {
+      launch_norm_generic<WithCombine, 256>(
+          queue,
+          hidden,
+          block,
+          injection,
+          injection_stride,
+          weight,
+          combined,
+          normed,
+          m,
+          eps);
+      return;
+    }
+  }
+  launch_norm_generic<WithCombine, 512>(
+      queue,
+      hidden,
+      block,
+      injection,
+      injection_stride,
+      weight,
+      combined,
+      normed,
+      m,
+      eps);
 }
 
 class GateKernel;
@@ -409,13 +488,15 @@ void launch_down(
           for (int k = split * (kWidth / Splits);
                k < (split + 1) * (kWidth / Splits);
                k += elements_per_lane * kSg) {
-            const auto weight_v =
-                load_vector<elements_per_lane, Rows == 1>(sg, w + k, w_aligned);
+            const auto weight_v = load_vector < elements_per_lane,
+                       Rows == 1 > (sg, w + k, w_aligned);
 #pragma unroll
             for (int r = 0; r < Rows; ++r) {
               if (token + r >= m) continue;
-              const auto x = load_vector<elements_per_lane, Rows == 1>(
-                  sg, input + int64_t(token + r) * kWidth + k, x_aligned);
+              const auto x = load_vector < elements_per_lane,
+                         Rows == 1 > (sg,
+                                      input + int64_t(token + r) * kWidth + k,
+                                      x_aligned);
 #pragma unroll
               for (int i = 0; i < elements_per_lane; ++i)
                 acc[r][i] =
@@ -457,6 +538,131 @@ void launch_down(
 template <bool FusedGate>
 class UpKernel;
 
+class UpGateM1PairKernel;
+
+void launch_up_gate_m1_pair(
+    sycl::queue& queue,
+    const half* input,
+    const half* weight,
+    const half* normed,
+    half* output,
+    bool x_aligned,
+    bool w_aligned) {
+  static_assert(kHidden % 2 == 0);
+  constexpr int groups = kHidden / 2;
+  constexpr size_t global = size_t((groups + 7) / 8) * 128;
+  // 每个子组顺序计算相邻两列，仅共享低秩输入，不同时保留八行权重。
+  queue.parallel_for<UpGateM1PairKernel>(
+      sycl::nd_range<1>(global, 128),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSg)]] {
+        const auto sg = item.get_sub_group();
+        const int group = item.get_global_linear_id() / kSg;
+        if (group >= groups) return;
+        const int h = group * 2;
+        const int lane = sg.get_local_linear_id();
+        const auto x0 = load_vector<16>(sg, input, x_aligned);
+        const auto x1 = load_vector<4>(sg, input + 256, x_aligned);
+        float mixed[2] = {};
+#pragma unroll
+        for (int branch = 0; branch < kStreams; ++branch) {
+#pragma unroll
+          for (int col = 0; col < 2; ++col) {
+            const int out_col = branch * kHidden + h + col;
+            const half* w = weight + int64_t(out_col) * kRank;
+            const auto w0 = load_vector<16>(sg, w, w_aligned);
+            const auto w1 = load_vector<4>(sg, w + 256, w_aligned);
+            float lane_sum = 0.0f;
+        // 每个输出仍按原来的 16+4 次 FMA 和子组归约顺序计算。
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+              lane_sum = sycl::fma(float(x0[i]), float(w0[i]), lane_sum);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+              lane_sum = sycl::fma(float(x1[i]), float(w1[i]), lane_sum);
+            const float total =
+                sycl::reduce_over_group(sg, lane_sum, sycl::plus<float>());
+            if (lane == 0) {
+              // 保留可观察的 FP16 舍入边界，不能折叠成 FP32 sigmoid。
+              volatile uint16_t gate_bits = sycl::bit_cast<uint16_t>(
+                  sycl::ext::intel::math::float2half_rn(total));
+              const half gate = sycl::bit_cast<half>(uint16_t(gate_bits));
+              mixed[col] += float(normed[out_col]) * sigmoid(float(gate));
+            }
+          }
+        }
+        if (lane == 0) {
+#pragma unroll
+          for (int col = 0; col < 2; ++col)
+            output[h + col] = half(mixed[col] * 0.25f);
+        }
+      });
+}
+
+class UpGateMultiPairKernel;
+
+void launch_up_gate_multi_pair(
+    sycl::queue& queue,
+    const half* input,
+    int64_t input_stride,
+    const half* weight,
+    const half* normed,
+    half* output,
+    int m,
+    bool x_aligned,
+    bool w_aligned) {
+  static_assert(kHidden % 2 == 0);
+  constexpr int pairs = kHidden / 2;
+  const int groups = m * pairs;
+  const size_t global = size_t((groups + 7) / 8) * 128;
+  // 每个 SG 只复用本行的低秩输入；不做跨 token 权重复用。
+  queue.parallel_for<UpGateMultiPairKernel>(
+      sycl::nd_range<1>(global, 128),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSg)]] {
+        const auto sg = item.get_sub_group();
+        const int group = item.get_global_linear_id() / kSg;
+        if (group >= groups) return;
+        const int row = group / pairs;
+        const int h = (group % pairs) * 2;
+        const int lane = sg.get_local_linear_id();
+        const half* x = input + int64_t(row) * input_stride;
+        const auto x0 = load_vector<16>(sg, x, x_aligned);
+        const auto x1 = load_vector<4>(sg, x + 256, x_aligned);
+        float mixed[2] = {};
+#pragma unroll
+        for (int branch = 0; branch < kStreams; ++branch) {
+#pragma unroll
+          for (int col = 0; col < 2; ++col) {
+            const int out_col = branch * kHidden + h + col;
+            const half* w = weight + int64_t(out_col) * kRank;
+            const auto w0 = load_vector<16>(sg, w, w_aligned);
+            const auto w1 = load_vector<4>(sg, w + 256, w_aligned);
+            float lane_sum = 0.0f;
+        // 保留原16+4次FMA、SG归约及每个输出的四分支累加顺序。
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+              lane_sum = sycl::fma(float(x0[i]), float(w0[i]), lane_sum);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+              lane_sum = sycl::fma(float(x1[i]), float(w1[i]), lane_sum);
+            const float total =
+                sycl::reduce_over_group(sg, lane_sum, sycl::plus<float>());
+            if (lane == 0) {
+              volatile uint16_t gate_bits = sycl::bit_cast<uint16_t>(
+                  sycl::ext::intel::math::float2half_rn(total));
+              const half gate = sycl::bit_cast<half>(uint16_t(gate_bits));
+              mixed[col] +=
+                  float(normed[row * kWidth + out_col]) * sigmoid(float(gate));
+            }
+          }
+        }
+        if (lane == 0) {
+#pragma unroll
+          for (int col = 0; col < 2; ++col)
+            output[row * kHidden + h + col] = half(mixed[col] * 0.25f);
+        }
+      });
+}
+
 template <bool FusedGate>
 void launch_up(
     sycl::queue& queue,
@@ -468,6 +674,33 @@ void launch_up(
     int m,
     bool x_aligned,
     bool w_aligned) {
+  if constexpr (FusedGate) {
+    if (m == 1) {
+      // M1默认复用相邻两列；显式0保留旧路径，图A/B需分别捕获。
+      const char* pair = std::getenv("QWEN38_HC_M1_UP_GATE_PAIR");
+      if (!pair || (pair[0] == '1' && pair[1] == '\0')) {
+        launch_up_gate_m1_pair(
+            queue, input, weight, normed, output, x_aligned, w_aligned);
+        return;
+      }
+    }
+    if (m >= 2 && m <= 8) {
+      const char* pair = std::getenv("QWEN38_HC_MULTI_UP_GATE_PAIR");
+      if (!pair || (pair[0] == '1' && pair[1] == '\0')) {
+        launch_up_gate_multi_pair(
+            queue,
+            input,
+            input_stride,
+            weight,
+            normed,
+            output,
+            m,
+            x_aligned,
+            w_aligned);
+        return;
+      }
+    }
+  }
   const int n = FusedGate ? kHidden : kWidth;
   const int groups = m * n;
   const size_t global = size_t((groups + 7) / 8) * 128;
@@ -603,6 +836,105 @@ void combine_norm(
       float(eps));
 }
 
+void prefill_grouped_norm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    torch::Tensor& output,
+    double eps) {
+  check_norm(input, weight, output, eps, kPrefillMaxM);
+  TORCH_CHECK(input.size(0) >= 9, "HC prefill requires M=9..4096");
+  const c10::DeviceGuard guard(input.device());
+  const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  auto& queue = stream.queue();
+  TORCH_CHECK(
+      queue.is_in_order(), "HC prefill requires an in-order current stream");
+  record({&input, &weight, &output}, stream);
+  launch_norm<false>(
+      queue,
+      data(input),
+      nullptr,
+      nullptr,
+      0,
+      data(weight),
+      nullptr,
+      mutable_data(output),
+      input.size(0),
+      float(eps));
+}
+
+void prefill_gate_mix(
+    const torch::Tensor& input,
+    const torch::Tensor& gate,
+    torch::Tensor& output) {
+  check_gate(input, gate, output, kPrefillMaxM);
+  TORCH_CHECK(input.size(0) >= 9, "HC prefill requires M=9..4096");
+  const c10::DeviceGuard guard(input.device());
+  const auto stream = c10::xpu::getCurrentXPUStream(input.get_device());
+  auto& queue = stream.queue();
+  TORCH_CHECK(
+      queue.is_in_order(), "HC prefill requires an in-order current stream");
+  record({&input, &gate, &output}, stream);
+  launch_gate(
+      queue, data(input), data(gate), mutable_data(output), input.size(0));
+}
+
+void prefill_combine(
+    const torch::Tensor& hidden,
+    const torch::Tensor& block,
+    const torch::Tensor& injection,
+    torch::Tensor& output) {
+  check_combine(hidden, block, injection, output, kPrefillMaxM);
+  TORCH_CHECK(hidden.size(0) >= 9, "HC prefill requires M=9..4096");
+  const c10::DeviceGuard guard(hidden.device());
+  const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
+  auto& queue = stream.queue();
+  TORCH_CHECK(
+      queue.is_in_order(), "HC prefill requires an in-order current stream");
+  record({&hidden, &block, &injection, &output}, stream);
+  launch_combine(
+      queue,
+      data(hidden),
+      data(block),
+      data(injection),
+      injection.stride(0),
+      mutable_data(output),
+      hidden.size(0));
+}
+
+void prefill_combine_norm(
+    const torch::Tensor& hidden,
+    const torch::Tensor& block,
+    const torch::Tensor& injection,
+    const torch::Tensor& weight,
+    torch::Tensor& combined,
+    torch::Tensor& normed,
+    double eps) {
+  check_combine(hidden, block, injection, combined, kPrefillMaxM);
+  check_norm(hidden, weight, normed, eps, kPrefillMaxM);
+  TORCH_CHECK(hidden.size(0) >= 9, "HC prefill requires M=9..4096");
+  check_distinct_outputs(
+      {&combined, &normed}, {&hidden, &block, &injection, &weight});
+  const c10::DeviceGuard guard(hidden.device());
+  const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
+  auto& queue = stream.queue();
+  TORCH_CHECK(
+      queue.is_in_order(), "HC prefill requires an in-order current stream");
+  record({&hidden, &block, &injection, &weight, &combined, &normed}, stream);
+  // M>8 自动避开 manual small-M 路径；真实 FP16 combine 边界仍由原 kernel
+  // 保留。
+  launch_norm<true>(
+      queue,
+      data(hidden),
+      data(block),
+      data(injection),
+      injection.stride(0),
+      data(weight),
+      mutable_data(combined),
+      mutable_data(normed),
+      hidden.size(0),
+      float(eps));
+}
+
 void down(
     const torch::Tensor& input,
     const torch::Tensor& weight,
@@ -718,8 +1050,9 @@ static void combine_mix_impl(
   const c10::DeviceGuard guard(hidden.device());
   const auto stream = c10::xpu::getCurrentXPUStream(hidden.get_device());
   auto& queue = stream.queue();
-  TORCH_CHECK(queue.is_in_order(),
-              "HC transaction requires an in-order current stream");
+  TORCH_CHECK(
+      queue.is_in_order(),
+      "HC transaction requires an in-order current stream");
   // A later submission may throw after norm/down already use these pointers.
   record(
       {&hidden,
@@ -856,8 +1189,9 @@ void project_mix(
   const c10::DeviceGuard guard(normed.device());
   const auto stream = c10::xpu::getCurrentXPUStream(normed.get_device());
   auto& queue = stream.queue();
-  TORCH_CHECK(queue.is_in_order(),
-              "HC transaction requires an in-order current stream");
+  TORCH_CHECK(
+      queue.is_in_order(),
+      "HC transaction requires an in-order current stream");
   record({&normed, &down_weight, &up_weight, &down_output, &mixed}, stream);
   const bool norm_aligned =
       !(reinterpret_cast<uintptr_t>(normed.data_ptr()) & 3);

@@ -280,3 +280,147 @@ def test_prefill_empty_and_overflowing_expert_counts(provider, k):
     output = operation(torch.ones((4, k), dtype=torch.float16, device="xpu"),
                        packed, scales, counts)
     assert torch.isnan(output).all().item()
+
+
+def test_packed_topk_finite_half_key_order_on_cpu():
+    # 穷举全部有限half编码，确认键排序与float排序相同，且正负零同分。
+    bits = torch.arange(65536, dtype=torch.int64)
+    values = bits.to(torch.int16).view(torch.float16).float()
+    mask = torch.isfinite(values)
+    bits, values = bits[mask], values[mask]
+    bits = torch.where((bits & 0x7fff) == 0, 0, bits)
+    ordered = torch.where(bits & 0x8000 != 0, (~bits) & 0xffff,
+                          bits ^ 0x8000)
+    permutation = torch.argsort(ordered, stable=True)
+    assert torch.equal(values[permutation], torch.sort(values).values)
+    assert ordered.min() > 0  # 移除候选的key=0小于任何有限分数。
+    equal_zero = ordered[values == 0]
+    assert torch.equal(equal_zero, torch.full_like(equal_zero, 0x8000))
+
+
+@pytest.mark.parametrize("rows", (1, 2, 8, 17))
+def test_down_prefetch_bitwise(provider, case, rows, monkeypatch):
+    ops = (provider.compact80_ops() if case["k"] == 80
+           else provider.compact160_ops())
+    operation = ops[0] if rows == 1 else ops[1]
+    results = []
+    for mode in ("0", "1", "0"):
+        monkeypatch.setenv("QWEN38_MOE_M1_DOWN_PREFETCH", mode)
+        output = torch.empty_like(case["x"][:rows])
+        operation(case["x"][:rows], case["logits"][:rows],
+                  *case["weights"], output, 10, 1, 512)
+        results.append(output.cpu())
+    assert all(torch.equal(results[0], result) for result in results[1:])
+
+
+@pytest.mark.parametrize("rows", (1, 2, 8))
+def test_router_wide_read_bitwise(provider, case, rows, monkeypatch):
+    factory = (provider.get_qwen38_moe_m1_direct_workspace_class() if rows == 1
+               else provider.get_qwen38_moe_multi_direct_workspace_class())
+    workspace = factory()
+    extra = () if rows == 1 else (False,)
+    results = []
+    for mode in ("4", "8", "4"):
+        monkeypatch.setenv("QWEN38_MOE_M1_ROUTER_VEC", mode)
+        output = workspace.try_run(case["x"][:rows], case["router"],
+                                   case["router_scale"], case["weights"],
+                                   case["k"], *extra)
+        assert output is not None
+        results.append(output.cpu())
+    assert all(torch.equal(results[0], result) for result in results[1:])
+
+
+@pytest.mark.parametrize("rows", (1, 2))
+def test_m1_tuning_default_dispatch_and_legacy(
+    provider, case, rows, monkeypatch
+):
+    factory = (provider.get_qwen38_moe_m1_direct_workspace_class() if rows == 1
+               else provider.get_qwen38_moe_multi_direct_workspace_class())
+    space = factory()
+    extra = () if rows == 1 else (False,)
+    for legacy in (False, True):
+        flags = {"QWEN38_MOE_M1_ROUTER_VEC": "4",
+                 "QWEN38_MOE_M1_PACKED_TOPK": "0",
+                 "QWEN38_MOE_M1_DOWN_PREFETCH": "0"}
+        for flag, value in flags.items():
+            if legacy:
+                monkeypatch.setenv(flag, value)
+            else:
+                monkeypatch.delenv(flag, raising=False)
+        args = (case["x"][:rows], case["router"], case["router_scale"],
+                case["weights"], case["k"], *extra)
+        assert space.try_run(*args) is not None
+        torch.xpu.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.XPU]
+        ) as prof:
+            assert space.try_run(*args) is not None
+        names = [event.name for event in prof.events()]
+        assert any("RouterBlockKernel<8>" in name for name in names) == (
+            not legacy and rows == 1 and case["k"] == 160)
+        assert any("TopKPackedSubgroupKernel" in name for name in names) == (
+            not legacy and rows == 1)
+        hit_down = any("DownBlockKernel<160, 16, 16, true>" in name
+                       for name in names)
+        assert hit_down == (not legacy and rows == 1 and case["k"] == 160)
+
+
+@pytest.mark.parametrize("pattern",
+                         ("random", "tie", "zero", "limits", "nan", "inf"))
+def test_packed_topk_bitwise_and_invalid(provider, case, pattern, monkeypatch):
+    generator = torch.Generator().manual_seed(20261009)
+    logits = torch.randn(1, 512, generator=generator).half()
+    if pattern == "tie":
+        logits = (torch.arange(512) % 5 - 3).half().view(1, 512)
+    elif pattern == "zero":
+        logits.zero_()
+        logits[:, 1::2] = -0.0
+    elif pattern == "limits":
+        logits = torch.linspace(-65504, 65504, 512).half().view(1, 512)
+    elif pattern in ("nan", "inf"):
+        logits[0, 511] = float(pattern)
+    logits = logits.to("xpu")
+    operation = (provider.compact80_ops() if case["k"] == 80
+                 else provider.compact160_ops())[0]
+    results = []
+    for switch in ("0", "1", "0"):
+        monkeypatch.setenv("QWEN38_MOE_M1_PACKED_TOPK", switch)
+        output = torch.full_like(case["x"][:1], -7)
+        operation(case["x"][:1], logits, *case["weights"], output, 10, 1, 512)
+        results.append(output.cpu())
+    if pattern in ("nan", "inf"):
+        assert all(torch.isnan(result).all() for result in results)
+    else:
+        assert all(torch.equal(results[0], result) for result in results[1:])
+        assert torch.isfinite(results[0]).all()
+
+
+def test_packed_topk_dispatch_and_graph(provider, case, monkeypatch):
+    operation = (provider.compact80_ops() if case["k"] == 80
+                 else provider.compact160_ops())[0]
+    x, logits = case["x"][:1].clone(), case["logits"][:1].clone()
+    captures = []
+    for mode in ("0", "1"):
+        monkeypatch.setenv("QWEN38_MOE_M1_PACKED_TOPK", mode)
+        output = torch.empty_like(x)
+        operation(x, logits, *case["weights"], output, 10, 1, 512)
+        torch.xpu.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.XPU]
+        ) as prof:
+            operation(x, logits, *case["weights"], output, 10, 1, 512)
+        names = [event.name for event in prof.events()]
+        hit = any("TopKPackedSubgroupKernel" in name for name in names)
+        assert hit == (mode == "1")
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            operation(x, logits, *case["weights"], output, 10, 1, 512)
+        captures.append((graph, output))
+    for seed in (1, 2, 3):
+        torch.manual_seed(seed)
+        logits.copy_(torch.randn_like(logits))
+        snapshots = []
+        for graph, output in captures:
+            graph.replay()
+            snapshots.append(output.cpu())
+        assert torch.equal(*snapshots)

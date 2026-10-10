@@ -30,6 +30,32 @@ void combine_norm(
     torch::Tensor& combined,
     torch::Tensor& normed,
     double eps);
+
+// 独立 prefill 元素算子：M=9..4096，FP16 HC4/H2560，不调用投影 GEMV。
+// 输出均由 caller 持有；保留 decode 算子的舍入、别名与 stream 契约。
+void prefill_grouped_norm(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    torch::Tensor& output,
+    double eps);
+void prefill_gate_mix(
+    const torch::Tensor& input,
+    const torch::Tensor& gate,
+    torch::Tensor& output);
+void prefill_combine(
+    const torch::Tensor& hidden,
+    const torch::Tensor& block,
+    const torch::Tensor& injection,
+    torch::Tensor& output);
+void prefill_combine_norm(
+    const torch::Tensor& hidden,
+    const torch::Tensor& block,
+    const torch::Tensor& injection,
+    const torch::Tensor& weight,
+    torch::Tensor& combined,
+    torch::Tensor& normed,
+    double eps);
+
 void down(
     const torch::Tensor& input,
     const torch::Tensor& weight,

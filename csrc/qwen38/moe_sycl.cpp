@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 
 namespace vllm::qwen38::moe_sycl {
 namespace {
@@ -28,6 +30,7 @@ inline int q40_nibble(std::uint8_t packed, bool high) {
 class RouterKernel;
 class TopKKernel;
 class TopKSubgroupKernel;
+class TopKPackedSubgroupKernel;
 class UpSharedKernel;
 class DownReduceKernel;
 
@@ -174,6 +177,71 @@ void launch_topk_subgroup(
           for (int j = 0; j < values_per_lane; ++j)
             if (j * lanes + lane == id)
               scores[j] = -std::numeric_limits<float>::infinity();
+        }
+        if (lane == 0) {
+          float top_sum = 0.0f;
+          float values[kTopK];
+#pragma unroll
+          for (int rank = 0; rank < kTopK; ++rank) {
+            values[rank] = sycl::exp(selected[rank] - selected[0]);
+            top_sum += values[rank];
+          }
+          const float inv_top = 1.0f / top_sum;
+#pragma unroll
+          for (int rank = 0; rank < kTopK; ++rank)
+            w.weights[token * kTopK + rank] = sycl::half(
+                invalid ? std::numeric_limits<float>::quiet_NaN()
+                        : values[rank] * inv_top);
+        }
+      });
+}
+
+// FP16分数和同分时的小expert id共用一个有序整数，省掉每轮第二次归约。
+// +/-0按原float比较视为同分；非有限输入沿用原来的NaN输出契约。
+void launch_topk_packed_subgroup(
+    sycl::queue& queue, Inputs p, Workspace w, const sycl::half* logits) {
+  constexpr int lanes = 32;
+  constexpr int values_per_lane = kExperts / lanes;
+  queue.parallel_for<TopKPackedSubgroupKernel>(
+      sycl::nd_range<1>(std::size_t(p.m) * lanes, lanes),
+      [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(lanes)]] {
+        const int token = item.get_group_linear_id();
+        const int lane = item.get_local_linear_id();
+        const auto group = item.get_sub_group();
+        std::uint32_t keys[values_per_lane];
+        int invalid_local = 0;
+#pragma unroll
+        for (int j = 0; j < values_per_lane; ++j) {
+          const int id = j * lanes + lane;
+          const auto value = logits[token * kExperts + id];
+          invalid_local |= !sycl::isfinite(float(value));
+          auto bits = sycl::bit_cast<std::uint16_t>(value);
+          if ((bits & 0x7fffU) == 0) bits = 0;
+          const std::uint16_t ordered = (bits & 0x8000U)
+                                            ? std::uint16_t(~bits)
+                                            : std::uint16_t(bits ^ 0x8000U);
+          keys[j] = (std::uint32_t(ordered) << 9) | (511U - id);
+        }
+        const bool invalid =
+            sycl::reduce_over_group(
+                group, invalid_local, sycl::maximum<int>()) != 0;
+        float selected[kTopK];
+#pragma unroll
+        for (int rank = 0; rank < kTopK; ++rank) {
+          std::uint32_t local_best = 0;
+#pragma unroll
+          for (int j = 0; j < values_per_lane; ++j)
+            local_best = sycl::max(local_best, keys[j]);
+          const auto best = sycl::reduce_over_group(
+              group, local_best, sycl::maximum<std::uint32_t>());
+          const int id = 511 - int(best & 511U);
+          if (lane == 0) {
+            selected[rank] = float(logits[token * kExperts + id]);
+            w.ids[token * kTopK + rank] = invalid ? rank : id;
+          }
+#pragma unroll
+          for (int j = 0; j < values_per_lane; ++j)
+            if (j * lanes + lane == id) keys[j] = 0;
         }
         if (lane == 0) {
           float top_sum = 0.0f;
@@ -376,22 +444,38 @@ bool try_forward(sycl::queue& queue, const Inputs& p, const Workspace& w) {
 
   // The validation boundary is above this line; never return false after it.
   if (router) {
-    if (native_block)
-      block::launch_router(queue, p, w);
-    else
+    if (native_block) {
+      const bool wide_router = p.m == 1 && p.intermediate == 160;
+      const char* vec_env =
+          wide_router ? std::getenv("QWEN38_MOE_M1_ROUTER_VEC") : nullptr;
+      const std::string_view vec =
+          vec_env ? vec_env : (wide_router ? "8" : "4");
+      if (vec == "8")
+        block::launch_router<8>(queue, p, w);
+      else
+        block::launch_router(queue, p, w);
+    } else
       launch_router(queue, p, w);
   }
-  if (p.m == 1)
-    launch_topk_subgroup(queue, p, w, router ? w.logits : p.logits);
-  else
+  if (p.m == 1) {
+    const char* packed = std::getenv("QWEN38_MOE_M1_PACKED_TOPK");
+    if (!packed || (packed[0] == '1' && packed[1] == '\0'))
+      launch_topk_packed_subgroup(queue, p, w, router ? w.logits : p.logits);
+    else
+      launch_topk_subgroup(queue, p, w, router ? w.logits : p.logits);
+  } else
     launch_topk(queue, p, w, router ? w.logits : p.logits);
   if (native_block) {
     p.intermediate == 160 ? block::launch_up<160>(queue, p, w)
                           : block::launch_up<80>(queue, p, w);
     if (p.intermediate == 160) {
-      if (p.m == 1)
-        block::launch_down<160, 16>(queue, p, w);
-      else if (p.m == 2)
+      if (p.m == 1) {
+        const char* prefetch = std::getenv("QWEN38_MOE_M1_DOWN_PREFETCH");
+        if (!prefetch || (prefetch[0] == '1' && prefetch[1] == '\0'))
+          block::launch_down<160, 16, 16, true>(queue, p, w);
+        else
+          block::launch_down<160, 16>(queue, p, w);
+      } else if (p.m == 2)
         block::launch_down<160, 8>(queue, p, w);
       else
         block::launch_down<160, 16>(queue, p, w);

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Standalone TP4 Qwen3.8 HC ordinary-SYCL tests (ZE_AFFINITY_MASK=5)."""
 
 import os
@@ -36,6 +37,23 @@ def final_reference():
     return torch.ops.qwen38_hc_final_esimd_reference
 
 
+@pytest.mark.parametrize("m", [1, 2])
+def test_pair_default_dispatch_only_m1(hc, monkeypatch, m):
+    monkeypatch.delenv("QWEN38_HC_M1_UP_GATE_PAIR", raising=False)
+    low = torch.randn(m, 320, device="xpu", dtype=torch.float16) * 0.1
+    weight = torch.randn(10240, 320, device="xpu", dtype=torch.float16) / 20
+    normed = torch.randn(m, 10240, device="xpu", dtype=torch.float16)
+    output = torch.empty(m, 2560, device="xpu", dtype=torch.float16)
+    hc.up_gate_mix(low, weight, normed, output)
+    torch.xpu.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.XPU]
+    ) as prof:
+        hc.up_gate_mix(low, weight, normed, output)
+    hit = any("UpGateM1PairKernel" in event.name for event in prof.events())
+    assert hit == (m == 1)
+
+
 def inputs(m):
     torch.manual_seed(1908 + m)
     x = torch.randn(m, 10240, device="xpu", dtype=torch.float16) * 0.2
@@ -56,6 +74,107 @@ def ref_norm(x, gamma, eps=1e-6):
     var = grouped.square().mean(-1, keepdim=True)
     normalized = grouped * torch.rsqrt(var + eps)
     return (normalized.flatten(-2) * (1 + gamma.float())).half()
+
+
+@pytest.fixture(scope="module")
+def prefill_hc():
+    if not torch.xpu.is_available():
+        pytest.skip("XPU unavailable")
+    torch.ops.load_library(str(LIBRARY))
+    return torch.ops._qwen38_C
+
+
+@pytest.mark.parametrize("m", [9, 17, 128, 4096])
+@pytest.mark.parametrize("injection_stride", [4, 336])
+@pytest.mark.parametrize("norm_local", ["256", "512"])
+def test_prefill_math_and_fp16_boundary(prefill_hc, monkeypatch, m,
+                                      injection_stride, norm_local):
+    monkeypatch.setenv("QWEN38_HC_PREFILL_NORM_LOCAL", norm_local)
+    x, block, injection, gamma = inputs(m)
+    padded = torch.empty(
+        (m, injection_stride), device="xpu", dtype=torch.float16)
+    padded[:, :4] = injection
+    strided_injection = padded[:, :4]
+    combined = torch.empty_like(x)
+    normed = torch.empty_like(x)
+    prefill_hc.hc_prefill_combine_norm(
+        x, block, strided_injection, gamma, combined, normed, 1e-6)
+    expected_combined = ref_combine(x, block, injection)
+    torch.testing.assert_close(
+        combined, expected_combined, atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        normed, ref_norm(expected_combined, gamma), atol=3e-3, rtol=2e-3)
+
+
+    prefill_hc.hc_prefill_combine(
+        x, block, strided_injection, combined)
+    torch.testing.assert_close(
+        combined, expected_combined, atol=1e-3, rtol=0)
+    prefill_hc.hc_prefill_grouped_norm(x, gamma, normed, 1e-6)
+    torch.testing.assert_close(
+        normed, ref_norm(x, gamma), atol=3e-3, rtol=2e-3)
+    gate = torch.randn_like(x) * 0.3
+    mixed = torch.empty_like(block)
+    prefill_hc.hc_prefill_gate_mix(normed, gate, mixed)
+    expected_mix = (torch.sigmoid(gate.float().reshape(m, 4, 2560)) *
+                    normed.float().reshape(m, 4, 2560)).mean(dim=1).half()
+    torch.testing.assert_close(
+        mixed, expected_mix, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("m", range(1, 9))
+def test_multi_up_pair_preserves_bits_and_m1(hc, monkeypatch, m):
+    torch.manual_seed(613 + m)
+    backing = torch.randn(m, 336, device="xpu", dtype=torch.float16) * 0.1
+    weight = torch.randn(10240, 320, device="xpu", dtype=torch.float16) / 20
+    normed = torch.randn(m, 10240, device="xpu", dtype=torch.float16) * 0.2
+    expected = torch.empty(m, 2560, device="xpu", dtype=torch.float16)
+    output = torch.empty_like(expected)
+    monkeypatch.setenv("QWEN38_HC_MULTI_UP_GATE_PAIR", "0")
+    hc.up_gate_mix(backing[:, :320], weight, normed, expected)
+    monkeypatch.setenv("QWEN38_HC_MULTI_UP_GATE_PAIR", "1")
+    hc.up_gate_mix(backing[:, :320], weight, normed, output)
+    assert torch.equal(output, expected)
+
+
+def test_prefill_preflight_preserves_outputs(prefill_hc):
+    x, block, injection, gamma = inputs(9)
+    output = torch.full_like(x, 7)
+    with pytest.raises(RuntimeError):
+        prefill_hc.hc_prefill_combine_norm(
+            x, block, injection, gamma, output, output, 1e-6)
+    assert torch.all(output == 7)
+    for eps in (0.0, float("nan"), float("inf"), 1e-50):
+        with pytest.raises(RuntimeError):
+            prefill_hc.hc_prefill_grouped_norm(x, gamma, output, eps)
+        assert torch.all(output == 7)
+    with pytest.raises(RuntimeError):
+        prefill_hc.hc_prefill_combine(x, block, injection, x)
+    small_x, _, _, small_gamma = inputs(8)
+    with pytest.raises(RuntimeError):
+        prefill_hc.hc_prefill_grouped_norm(
+            small_x, small_gamma, torch.empty_like(small_x), 1e-6)
+
+
+def test_prefill_async_lifetime(prefill_hc):
+    x, block, injection, gamma = inputs(17)
+    combined = torch.empty_like(x)
+    normed = torch.empty_like(x)
+    stream = torch.xpu.Stream()
+    stream.wait_stream(torch.xpu.current_stream())
+    with torch.xpu.stream(stream):
+        temporary = x * 1.0
+        prefill_hc.hc_prefill_combine_norm(
+            temporary, block, injection, gamma, combined, normed, 1e-6)
+        del temporary
+        for _ in range(8):
+            torch.empty_like(x)
+    stream.synchronize()
+    expected_combined = ref_combine(x, block, injection)
+    torch.testing.assert_close(
+        combined, expected_combined, atol=1e-3, rtol=0)
+    torch.testing.assert_close(
+        normed, ref_norm(expected_combined, gamma), atol=3e-3, rtol=2e-3)
 
 
 def ref_down(x, weight):
@@ -260,7 +379,10 @@ def test_esimd_projection_and_unaligned_view(hc, m):
     torch.testing.assert_close(odd_result, ours, atol=3e-3, rtol=2e-3)
 
 
-def test_chain_preflight_before_submit_and_two_async_streams(hc):
+@pytest.mark.parametrize("pair", ["0", "1"])
+def test_chain_preflight_before_submit_and_two_async_streams(
+        hc, monkeypatch, pair):
+    monkeypatch.setenv("QWEN38_HC_M1_UP_GATE_PAIR", pair)
     x, block, inj, gamma = inputs(1)
     down_w = torch.randn((336, 10240), device="xpu", dtype=torch.float16) / 32
     up_w = torch.randn((10240, 320), device="xpu", dtype=torch.float16) / 20
@@ -404,7 +526,9 @@ def test_combine_norm_has_real_fp16_rounding(hc, final_reference):
     assert unrounded_mismatch >= 1000
 
 
-def test_up_gate_has_real_fp16_rounding(hc, final_reference):
+@pytest.mark.parametrize("pair", ["0", "1"])
+def test_up_gate_has_real_fp16_rounding(hc, final_reference, monkeypatch, pair):
+    monkeypatch.setenv("QWEN38_HC_M1_UP_GATE_PAIR", pair)
     # A one-term dot product isolates the gate's FP32 -> FP16 -> FP32 edge.
     # An optimized-away cast changes thousands of outputs while still passing
     # the usual loose allclose check.
@@ -425,7 +549,7 @@ def test_up_gate_has_real_fp16_rounding(hc, final_reference):
             final_reference.up_gate_mix(low, weight, normed, reference)
         linear = low[0, 0].float() * weight[:, 0].float()
 
-        def mix(gate):
+        def mix(gate, normed=normed):
             return (normed.float().reshape(4, 2560) *
                     torch.sigmoid(gate.reshape(4, 2560))).sum(0).mul(
                         0.25).half()
@@ -433,12 +557,135 @@ def test_up_gate_has_real_fp16_rounding(hc, final_reference):
         rounded = mix(linear.half().float())
         unrounded = mix(linear)
         if final_reference is not None:
-            oracle_mismatch += int((ours.flatten() != reference.flatten()).sum())
+            oracle_mismatch += int(
+                (ours.flatten() != reference.flatten()).sum())
         rounded_mismatch += int((ours.flatten() != rounded).sum())
         unrounded_mismatch += int((ours.flatten() != unrounded).sum())
     assert oracle_mismatch <= 16
     assert rounded_mismatch <= 16
     assert unrounded_mismatch >= 1000
+
+
+@pytest.mark.parametrize("m", [1, 2, 8])
+@pytest.mark.parametrize("odd", [False, True])
+def test_up_gate_pair_runtime_bitwise_ab(hc, monkeypatch, m, odd):
+    torch.manual_seed(6109 + m)
+    # 保留 336 的物理步长，并覆盖低秩输入与权重仅两字节对齐的回退。
+    padded = torch.randn((m, 336), device="xpu", dtype=torch.float16) * 0.2
+    low = padded[:, 1:321] if odd else padded[:, :320]
+    weight_storage = torch.randn((10240 * 320 + int(odd), ),
+                                 device="xpu",
+                                 dtype=torch.float16) / 20
+    weight = weight_storage[int(odd):].view(10240, 320)
+    normed = torch.randn((m, 10240), device="xpu", dtype=torch.float16) * 0.2
+    baseline = torch.empty((m, 2560), device="xpu", dtype=torch.float16)
+    ordinary = torch.empty_like(normed)
+    monkeypatch.delenv("QWEN38_HC_M1_UP_GATE_PAIR", raising=False)
+    hc.up_gate_mix(low, weight, normed, baseline)
+    hc.up(low, weight, ordinary)
+    torch.testing.assert_close(baseline,
+                               ref_up_gate(low, weight, normed),
+                               atol=3e-3,
+                               rtol=2e-3)
+    # 同一进程、同一动态库开启后再次关闭；M>1 和普通 up 不应改路。
+    for mode in ("1", "0", "true", "10", ""):
+        monkeypatch.setenv("QWEN38_HC_M1_UP_GATE_PAIR", mode)
+        actual = torch.empty_like(baseline)
+        hc.up_gate_mix(low, weight, normed, actual)
+        assert torch.equal(actual.view(torch.int16), baseline.view(torch.int16))
+        actual_up = torch.empty_like(ordinary)
+        hc.up(low, weight, actual_up)
+        assert torch.equal(actual_up.view(torch.int16),
+                           ordinary.view(torch.int16))
+
+
+def test_up_gate_pair_graph_bitwise_ab(hc, monkeypatch):
+    torch.manual_seed(6110)
+    low = torch.randn((1, 336), device="xpu", dtype=torch.float16)[:, :320]
+    weight = torch.randn((10240, 320), device="xpu", dtype=torch.float16) / 20
+    normed = torch.randn((1, 10240), device="xpu", dtype=torch.float16) * 0.2
+    outputs = [torch.empty((1, 2560), device="xpu", dtype=torch.float16)
+               for _ in range(2)]
+    graphs = []
+    for mode, output in zip(("0", "1"), outputs):
+        monkeypatch.setenv("QWEN38_HC_M1_UP_GATE_PAIR", mode)
+        hc.up_gate_mix(low, weight, normed, output)
+        torch.xpu.synchronize()
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            hc.up_gate_mix(low, weight, normed, output)
+        graphs.append(graph)
+    # getenv 在提交或捕获时生效；回放已有图不重新分派，A/B 需分别捕获。
+    monkeypatch.setenv("QWEN38_HC_M1_UP_GATE_PAIR", "0")
+    for _ in range(2):
+        low.mul_(0.5)
+        for graph in graphs:
+            graph.replay()
+        torch.xpu.synchronize()
+        assert torch.equal(outputs[0].view(torch.int16),
+                           outputs[1].view(torch.int16))
+        eager = torch.empty_like(outputs[0])
+        hc.up_gate_mix(low, weight, normed, eager)
+        assert torch.equal(outputs[0].view(torch.int16),
+                           eager.view(torch.int16))
+
+
+@pytest.mark.parametrize("m", [1, 4, 8])
+def test_pair_chain_workspace_and_full_down_contract(hc, monkeypatch, m):
+    x, block, inj, gamma = inputs(m)
+    down_w = torch.randn((336, 10240), device="xpu", dtype=torch.float16) / 32
+    up_w = torch.randn((10240, 320), device="xpu", dtype=torch.float16) / 20
+    cls = (torch.classes.qwen38_hc_sycl.HCWorkspace
+           if m == 1 else torch.classes.qwen38_hc_sycl.HCMultiMWorkspaceV1)
+    owner = cls()
+    baseline = None
+    for mode in ("0", "1", "0"):
+        monkeypatch.setenv("QWEN38_HC_M1_UP_GATE_PAIR", mode)
+        combined = torch.empty_like(x)
+        normed = torch.empty_like(x)
+        low = torch.full((m, 336), 7, device="xpu", dtype=torch.float16)
+        mixed = torch.empty_like(block)
+        hc.combine_mix(x, block, inj, gamma, down_w, up_w, combined, normed,
+                       low, mixed, 1e-6)
+        standalone = torch.empty_like(low)
+        hc.down(normed, down_w, standalone)
+        assert torch.equal(low.view(torch.int16), standalone.view(torch.int16))
+        project_low = torch.empty_like(low)
+        project_mix = torch.empty_like(mixed)
+        hc.project_mix(normed, down_w, up_w, project_low, project_mix)
+        assert torch.equal(project_low.view(torch.int16), low.view(torch.int16))
+        assert torch.equal(project_mix.view(torch.int16),
+                           mixed.view(torch.int16))
+
+        result = owner.run(x, block, inj, gamma, down_w, up_w, 1e-6)
+        assert torch.equal(result[0].view(torch.int16),
+                           combined.view(torch.int16))
+        assert torch.equal(result[1].view(torch.int16), mixed.view(torch.int16))
+        next_inj = result[2]
+        assert next_inj.stride() == (336, 1)
+        # 返回的 injection 视图暴露同一 storage，不能把末尾十二行当不可观察。
+        full_down = next_inj.as_strided(
+            (m, 336), (336, 1), next_inj.storage_offset() - 320)
+        assert torch.equal(full_down.view(torch.int16), low.view(torch.int16))
+        mix_only = owner.try_mix(normed, down_w, up_w)
+        assert mix_only is not None
+        assert torch.equal(mix_only[0].view(torch.int16),
+                           mixed.view(torch.int16))
+        mix_down = mix_only[1].as_strided(
+            (m, 336), (336, 1), mix_only[1].storage_offset() - 320)
+        assert torch.equal(mix_down.view(torch.int16), low.view(torch.int16))
+
+        current = (combined, normed, low, mixed)
+        if baseline is None:
+            baseline = tuple(t.clone() for t in current)
+            torch.testing.assert_close(low,
+                                       ref_down(normed, down_w),
+                                       atol=3e-3,
+                                       rtol=2e-3)
+        else:
+            for actual, expected in zip(current, baseline):
+                assert torch.equal(actual.view(torch.int16),
+                                   expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("m", range(1, 9))

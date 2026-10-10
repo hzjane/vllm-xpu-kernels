@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Independent math oracle and guarded TP4 GDN projection integration tests.
 
 The final ESIMD package is a test-only oracle; production never imports it.
@@ -10,7 +11,6 @@ from pathlib import Path
 
 import pytest
 import torch
-
 
 EPS = 1e-6
 FINAL_ESIMD = (
@@ -116,6 +116,20 @@ def _call(op, case, sigmoid=True):
     return output.cpu()
 
 
+def test_tp4_default_output_tile_hit(native_op, monkeypatch):
+    monkeypatch.delenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE", raising=False)
+    case = tuple(t.to("xpu") for t in _case())
+    output = torch.empty(1, 2560, dtype=torch.half, device="xpu")
+    native_op(*case, output, 12, 128, EPS, True)
+    torch.xpu.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.XPU]
+    ) as prof:
+        native_op(*case, output, 12, 128, EPS, True)
+    assert any("GdnNormInt4FusedKernel<32>" in event.name
+               for event in prof.events())
+
+
 def test_tp4_fused_independent_golden(native_op):
     case = _case()
     actual = _call(native_op, case)
@@ -130,6 +144,34 @@ def test_tp4_fused_rejects_half_boundary(native_op):
     assert good >= int(0.9 * rows.numel())
     assert good >= bad + int(0.75 * rows.numel())
     assert torch.count_nonzero(actual[0, rows.numel():]) == 0
+
+
+@pytest.mark.parametrize("tile", ["32"])
+@pytest.mark.parametrize("seed", [419, 733, 20261009])
+def test_tp4_output_tiles_preserve_bitwise_projection(
+    native_op, monkeypatch, tile, seed
+):
+    # 只共享FP32 norm，不改变每个输出的half边界和pairwise归约。
+    case = _case(seed=seed)
+    monkeypatch.setenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE", "16")
+    expected = _call(native_op, case)
+    monkeypatch.setenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE", tile)
+    actual = _call(native_op, case)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("tile", ["32"])
+def test_tp4_output_tiles_keep_fp32_norm_boundary(native_op, monkeypatch, tile):
+    case, fp32_expected, half_expected, rows = _discriminator()
+    monkeypatch.setenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE", "16")
+    expected = _call(native_op, case)
+    monkeypatch.setenv("VLLM_XPU_QWEN38_GDN_OUTPUT_TILE", tile)
+    actual = _call(native_op, case)
+    assert torch.equal(actual, expected)
+    good = (actual[0, rows] == fp32_expected[0, rows]).sum().item()
+    bad = (actual[0, rows] == half_expected[0, rows]).sum().item()
+    assert good >= int(0.9 * rows.numel())
+    assert good >= bad + int(0.75 * rows.numel())
 
 
 def test_tp4_final_esimd_oracle_only(native_op):
