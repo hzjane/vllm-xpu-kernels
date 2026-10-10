@@ -15,11 +15,11 @@ Torch dispatcher 与 direct Pybind 共用这一 DSO，不混载独立测试库�
 
 | 模块族 | 统一模块入口与 provider |
 | --- | --- |
-| HC | `_qwen38_C` 的 norm/combine/gate/down/up；`qwen38_hc_sycl` workspace 和同一 DSO 的 direct class。TP4维度10240/2560、低秩320，M1/M2–8。 |
+| HC | `_qwen38_C` 的 norm/combine/gate/down/up；`qwen38_hc_sycl` workspace 和同一 DSO 的 direct class。TP4维度10240/2560、低秩320，M1/M2–8。另有 `hc_prefill_grouped_norm`、`hc_prefill_combine`、`hc_prefill_combine_norm`、`hc_prefill_gate_mix` 四个 M9–4096 入口，只融合原FP16边界/FP32数学，不改变GEMM；caller-owned输出、alias预检和当前in-order stream生命周期保留。 |
 | PLE | 13个 `ple_*` dispatcher：NGram、embedding、norm、score/gate、融合 norm、residual 和 decode/prefill/spec short-conv。trusted 元数据只接受生产者证明，不把普通调用伪装 trusted。 |
 | GDN | `gdn_decode_sycl`、`gdn_spec_v2_sycl`、`gdn_norm_gate_sycl`、`gdn_norm_int4_sycl`；`qwen38_gdn.py` 保留模型侧参数顺序。TP4/TP8 sequential 几何；不宣告未实现的 interleaved 布局。 |
 | MoE | `qwen38_moe_sycl` dispatcher/classes、同一 DSO 的 direct workspace；`qwen38_moe.py` 提供 compact80/160 tuple与prefill DOWN。router是Q4_0，routed权重是signed-S4，不能混淆。 |
-| QSA | direct Pybind 的 compression、selection、token-split attention、QKV/norm/RoPE、cache-store/M1 transaction；`qwen38_qsa.py` 保留旧 positional ABI并传真实 host max_seq_len。M≤4096，C++分块复用显式 scratch。 |
+| QSA | direct Pybind 的 compression、selection、token-split attention、QKV/norm/RoPE、cache-store/M1 transaction；`qwen38_qsa.py` 保留旧 positional ABI并传真实 host max_seq_len。M≤4096，C++分块复用显式 scratch。BMG G31、localQ6、M≥128 的 FP16 prefill 默认采用三头 QK-DPAS，P/PV仍FP32，空tile跳过；小M和不支持布局保持旧后端，可用 `QWEN38_QSA_PREFILL_QK_DPAS=0` 回切。 |
 | Host preflight | 私有 Pybind `tensors_disjoint_host` 检查实际地址与带 pitch 的内存行；`TensorBindingSnapshotV1` 批量核对活动 tensor 绑定。均无设备提交。Python 调用方必须先过滤自定义 tensor/Torch modes；inference 内容 reload 仍需显式清除缓存。 |
 | GDN M1 host transaction | 私有 `GDNM1WorkspaceDirectV1` 合并输入 INT4 投影、GDN core、norm+输出 INT4 的主机检查/提交，复用原三个设备实现，不是单设备 kernel。仅 TP4/TP8 FP16 M1 sequential；其余在提交前返回 None。活动参数、别名与 stream 检查保留，转换失败清除旧绑定见证，reload 调用 invalidate。 |
 | GDN speculative host transaction | 私有 `GDNSpecWorkspaceDirectV1` 合并两次 INT4 输入投影、spec GDN、norm 和 INT4 输出投影的主机检查/提交，仍是多个设备 kernel。仅 TP4/TP8、FP16、单个 speculative 序列、M2–8、sequential；接受 padded state/token indices，并保留 FP32 A_log。Python 侧 sigmoid norm 仅允许原权重 FP16，其余提交前回退。实时绑定、alias、current-stream 与 reload 失效规则同 M1；scratch 分配全部成功后才发布，分配失败可重试。 |

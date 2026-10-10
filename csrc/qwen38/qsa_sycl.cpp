@@ -9,6 +9,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <sycl/ext/oneapi/bfloat16.hpp>
 #include <sycl/ext/oneapi/experimental/group_load_store.hpp>
+#include <sycl/ext/oneapi/experimental/device_architecture.hpp>
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 
@@ -20,6 +21,12 @@
 #include <initializer_list>
 #include <limits>
 #include <type_traits>
+
+#include <cute/tensor.hpp>
+#include <cute/arch/mma_xe.hpp>
+#ifdef printf
+  #undef printf
+#endif
 
 namespace vllm::qwen38::qsa_sycl {
 namespace {
@@ -36,6 +43,8 @@ template <typename T, bool PowerOfTwo>
 class CompressKernel;
 template <int PageSize, bool BlockRead, int Subgroup>
 class AttentionPhase0;
+template <int PageSize>
+class AttentionPrefillQkDpasPhase0;
 template <int Columns>
 class AttentionPhase1;
 
@@ -233,6 +242,193 @@ void launch_compress(
           first[row * first_row_stride + column] = value;
         }
       });
+}
+
+template <int PageSize>
+sycl::event launch_prefill_qk_dpas_phase0(
+    sycl::queue& queue,
+    const half* q,
+    const half* packed,
+    const int32_t* indices,
+    const int32_t* table,
+    const int32_t* reqs,
+    float* partials,
+    int rows,
+    int table_rows,
+    int table_stride,
+    int physical_pages,
+    int tokens_per_partial,
+    int partial_count,
+    sycl::event previous,
+    bool has_previous) {
+  using Mma = cute::XE_DPAS_TT<4, float, cute::half_t>;
+  static_assert(Mma::K == 16 && kHeadDim % Mma::K == 0);
+  constexpr int total_heads = 6;
+  constexpr int heads = 3;
+  constexpr int head_groups = total_heads / heads;
+  constexpr int subgroups = 4;
+  constexpr int values_per_lane = kHeadDim / kSg;
+  constexpr float log2_e = 1.4426950408889634f;
+  const int64_t tasks =
+      static_cast<int64_t>(rows) * partial_count * head_groups;
+  const int64_t groups = (tasks + subgroups - 1) / subgroups;
+  return queue.submit([&](sycl::handler& cgh) {
+    if (has_previous) cgh.depends_on(previous);
+    cgh.parallel_for<AttentionPrefillQkDpasPhase0<PageSize>>(
+        sycl::nd_range<1>(
+            sycl::range<1>(groups * subgroups * kSg),
+            sycl::range<1>(subgroups * kSg)),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(kSg)]] {
+          const auto sg = item.get_sub_group();
+          const int lane = int(sg.get_local_linear_id());
+          const int64_t task = int64_t(item.get_group_linear_id()) * subgroups +
+                               int(item.get_local_linear_id()) / kSg;
+          // 每个子组独占一组头的一个 partial；尾部子组独立退出，无组间
+          // barrier。
+          if (task >= tasks) return;
+          const int head_base = int(task % head_groups) * heads;
+          const int64_t row_partial = task / head_groups;
+          const int row = int(row_partial / partial_count);
+          const int partial = int(row_partial % partial_count);
+          const int request = reqs[row];
+          const bool valid_request = request >= 0 && request < table_rows;
+          const int32_t* row_indices = indices + int64_t(row) * kSlots;
+          const half* row_q =
+              q + (int64_t(row) * total_heads + head_base) * kHeadDim;
+          float maximum[heads];
+          float denominator[heads] = {};
+          float output[heads][values_per_lane] = {};
+#pragma unroll
+          for (int h = 0; h < heads; ++h)
+            maximum[h] = -1.0e30f;
+          namespace sx = sycl::ext::oneapi::experimental;
+          constexpr auto props = sx::properties{
+              sx::data_placement_striped,
+              sx::contiguous_memory,
+              sx::full_group};
+
+          for (int tile = 0; tile < tokens_per_partial; tile += kSg) {
+            const int slot = partial * tokens_per_partial + tile + lane;
+            const int logical =
+                tile + lane < tokens_per_partial && slot < kSlots
+                    ? row_indices[slot]
+                    : -1;
+            const int logical_page = logical >= 0 ? logical / PageSize : -1;
+            const bool table_ok = valid_request && logical_page >= 0 &&
+                                  logical_page < table_stride;
+            const int physical =
+                table_ok ? table[int64_t(request) * table_stride + logical_page]
+                         : -1;
+            const int valid = physical >= 0 && physical < physical_pages;
+            // 空tile不贡献任何softmax质量，也不需执行QK或重缩放已有PV。
+            if (!sycl::any_of_group(sg, valid != 0)) continue;
+            const int64_t base =
+                valid
+                    ? (int64_t(physical) * PageSize + logical % PageSize) * 512
+                    : 0;
+            const int token0 = lane / 2;
+            const int token1 = token0 + 8;
+            const int valid0 = sycl::select_from_group(sg, valid, token0);
+            const int valid1 = sycl::select_from_group(sg, valid, token1);
+            const int64_t base0 = sycl::select_from_group(sg, base, token0);
+            const int64_t base1 = sycl::select_from_group(sg, base, token1);
+            const int parity = lane & 1;
+            typename Mma::DVector scores = {};
+            for (int kb = 0; kb < kHeadDim; kb += Mma::K) {
+              typename Mma::AVector a_frag;
+              typename Mma::BVector b_frag;
+#pragma unroll
+              for (int h = 0; h < 4; ++h) {
+                const half value =
+                    h < heads ? row_q[h * kHeadDim + kb + lane] : half(0);
+                a_frag[h] = sycl::bit_cast<uint16_t>(value);
+              }
+          // 沿用 HC probe 已验证的 B fragment：两列交错，lane 奇偶选 K。
+#pragma unroll
+              for (int j = 0; j < 8; ++j) {
+                const int k = kb + 2 * j + parity;
+                const half key0 = valid0 ? packed[base0 + k] : half(0);
+                const half key1 = valid1 ? packed[base1 + k] : half(0);
+                b_frag[2 * j] = sycl::bit_cast<uint16_t>(key0);
+                b_frag[2 * j + 1] = sycl::bit_cast<uint16_t>(key1);
+              }
+              Mma::fma(scores, a_frag, b_frag, scores);
+            }
+
+            float probability[heads];
+#pragma unroll
+            for (int h = 0; h < heads; ++h) {
+              const float score = valid ? scores[h] * 0.0625f : -1.0e30f;
+              const float tile_max =
+                  sycl::reduce_over_group(sg, score, sycl::maximum<float>());
+              const float next_max = sycl::fmax(maximum[h], tile_max);
+              const float rescale =
+                  sycl::native::exp2((maximum[h] - next_max) * log2_e);
+              // 全空 tile 的质量必须为零，不能把哨兵之间的 exp(0) 算入分母。
+              probability[h] =
+                  valid ? sycl::native::exp2((score - next_max) * log2_e)
+                        : 0.0f;
+              const float tile_sum = sycl::reduce_over_group(
+                  sg, probability[h], sycl::plus<float>());
+              denominator[h] = denominator[h] * rescale + tile_sum;
+#pragma unroll
+              for (int d = 0; d < values_per_lane; ++d)
+                output[h][d] *= rescale;
+              maximum[h] = next_max;
+            }
+
+            for (int token = 0; token < kSg; ++token) {
+              const int token_valid = sycl::select_from_group(sg, valid, token);
+              if (!token_valid) continue;
+              const int64_t value_base =
+                  sycl::select_from_group(sg, base, token) + kHeadDim;
+              // 广播后的地址在子组内一致，V 位值仅加载一次共用本组的三或六头。
+              sycl::vec<uint32_t, values_per_lane / 2> value_words;
+              sx::group_load(
+                  sg,
+                  sycl::address_space_cast<
+                      sycl::access::address_space::global_space,
+                      sycl::access::decorated::yes>(
+                      reinterpret_cast<const uint32_t*>(packed + value_base)),
+                  value_words,
+                  props);
+              float token_probability[heads];
+#pragma unroll
+              for (int h = 0; h < heads; ++h)
+                token_probability[h] =
+                    sycl::select_from_group(sg, probability[h], token);
+#pragma unroll
+              for (int d = 0; d < values_per_lane; ++d) {
+                const uint32_t bits = value_words[d / 2];
+                const float value = static_cast<float>(sycl::bit_cast<half>(
+                    uint16_t((d & 1) ? bits >> 16 : bits)));
+#pragma unroll
+                for (int h = 0; h < heads; ++h)
+                  output[h][d] =
+                      sycl::fma(token_probability[h], value, output[h][d]);
+              }
+            }
+          }
+
+#pragma unroll
+          for (int h = 0; h < heads; ++h) {
+            const int64_t offset =
+                ((int64_t(row) * total_heads + head_base + h) *
+                     kStoragePartials +
+                 partial) *
+                kPartialStride;
+            if (lane == 0) {
+              partials[offset] = maximum[h];
+              partials[offset + 1] = denominator[h];
+            }
+#pragma unroll
+            for (int d = 0; d < values_per_lane; ++d) {
+              const int column = 2 * (lane + kSg * (d / 2)) + (d & 1);
+              partials[offset + 2 + column] = output[h][d];
+            }
+          }
+        });
+  });
 }
 
 template <int PageSize, bool BlockRead, int Subgroup>
@@ -819,9 +1015,6 @@ at::Tensor token_split_attention_v3(
       stream);
   const int total_rows = static_cast<int>(q.size(0));
   const int heads = static_cast<int>(q.size(1));
-  const int tokens_per_partial = total_rows == 1 ? 64 : 48;
-  const int partial_count =
-      (kSlots + tokens_per_partial - 1) / tokens_per_partial;
   auto* partial_ptr = partials.data_ptr<float>();
   const auto* q_ptr = static_cast<const half*>(q.data_ptr());
   const auto* packed_ptr = static_cast<const half*>(packed_kv.data_ptr());
@@ -832,6 +1025,31 @@ at::Tensor token_split_attention_v3(
   const bool aligned = ((reinterpret_cast<uintptr_t>(q_ptr) |
                          reinterpret_cast<uintptr_t>(packed_ptr)) &
                         3) == 0;
+  bool prefill_qk_dpas = false;
+  if (total_rows >= 128 && heads == 6 && aligned) {
+    const char* enabled = std::getenv("QWEN38_QSA_PREFILL_QK_DPAS");
+    namespace sx = sycl::ext::oneapi::experimental;
+    prefill_qk_dpas =
+        (!enabled || std::strcmp(enabled, "1") == 0) &&
+        queue.get_device().get_info<sx::info::device::architecture>() ==
+            sx::architecture::intel_gpu_bmg_g31;
+  }
+  int tokens_per_partial = total_rows == 1 ? 64 : 48;
+  if (total_rows >= 128) {
+    // 三头DPAS使用48slot；旧prefill后端用256slot。小M沿用原选择。
+    tokens_per_partial = prefill_qk_dpas ? 48 : 256;
+    const char* tokens = std::getenv("QWEN38_QSA_PREFILL_TOKENS_PER_PARTIAL");
+    if (tokens && std::strcmp(tokens, "48") == 0)
+      tokens_per_partial = 48;
+    else if (tokens && std::strcmp(tokens, "64") == 0)
+      tokens_per_partial = 64;
+    else if (tokens && std::strcmp(tokens, "128") == 0)
+      tokens_per_partial = 128;
+    else if (tokens && std::strcmp(tokens, "256") == 0)
+      tokens_per_partial = 256;
+  }
+  const int partial_count =
+      (kSlots + tokens_per_partial - 1) / tokens_per_partial;
   auto launch = [&](auto page_tag,
                     auto block_tag,
                     int rows,
@@ -842,6 +1060,26 @@ at::Tensor token_split_attention_v3(
     const auto* row_indices =
         indices_ptr + static_cast<int64_t>(offset) * kSlots;
     const auto* row_reqs = req_ptr + offset;
+    if constexpr (decltype(block_tag)::value) {
+      if (prefill_qk_dpas) {
+        return launch_prefill_qk_dpas_phase0<decltype(page_tag)::value>(
+            queue,
+            row_q,
+            packed_ptr,
+            row_indices,
+            table_ptr,
+            row_reqs,
+            partial_ptr,
+            rows,
+            block_table.size(0),
+            block_table.size(1),
+            packed_kv.size(0),
+            tokens_per_partial,
+            partial_count,
+            previous,
+            has_previous);
+      }
+    }
     if (total_rows == 1) {
       return launch_phase0<
           decltype(page_tag)::value,

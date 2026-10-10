@@ -364,6 +364,22 @@ def test_attention_prefill_cpp_chunk_owner(native, rows):
                                rtol=0.004)
 
 
+@pytest.mark.parametrize("tokens", ["64", "128", "256", "invalid"])
+@pytest.mark.parametrize("rows", [9, 129])
+@pytest.mark.parametrize("dpas", ["0", "1"])
+def test_attention_prefill_partition_override(native, monkeypatch, tokens, rows,
+                                               dpas):
+    monkeypatch.setenv("QWEN38_QSA_PREFILL_TOKENS_PER_PARTIAL", tokens)
+    monkeypatch.setenv("QWEN38_QSA_PREFILL_QK_DPAS", dpas)
+    case = attention_case(rows, 6, 4096, 512)
+    output = torch.empty_like(case[0])
+    partials = torch.empty(min(rows, 128), 6, 43, 258,
+                           dtype=torch.float32, device="xpu")
+    native.token_split_attention_v3(*case, 512, output, partials)
+    torch.testing.assert_close(output.cpu(), attention_golden(case),
+                               atol=0.004, rtol=0.004)
+
+
 def test_attention_prefill_4096_cpp_chunk_owner(native):
     case = attention_case(4096, 6, 128, 256)
     output = torch.empty_like(case[0])
@@ -786,7 +802,8 @@ def test_aux_qkv_rejects_missing_position_proof_before_submit(native):
         assert bool((tensor == 7).all())
 
 
-@pytest.mark.parametrize("rows,mrope", [(1, False), (8, True), (65, True)])
+@pytest.mark.parametrize("rows,mrope", [(1, False), (8, True), (65, True),
+                                      (4096, False), (4096, True)])
 def test_aux_indexer_norm_rope_final_esimd(native, rows, mrope):
     reference = _final_reference()
 
