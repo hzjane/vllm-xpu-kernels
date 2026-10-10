@@ -100,3 +100,15 @@ def test_router_rejects_root_that_changes_output_rank():
     root = torch.ones(1, 1, 1, device="xpu", dtype=x.dtype)
     with pytest.raises(RuntimeError, match="scalar root"):
         torch.ops._xpu_C.gemma4_router_preprocess(x, root, scale, 1e-6)
+
+
+def test_new_process_registers_ops_before_aot_loading():
+    import subprocess
+    import sys
+
+    code = (
+        "import torch,vllm_xpu_kernels; "
+        "assert hasattr(torch.ops._xpu_C,'gemma4_router_preprocess'); "
+        "assert hasattr(torch.ops._xpu_C,'gemma4_qkv_norm_rope')"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

@@ -15,3 +15,11 @@ if MOE_DECODE_KERNELS_AVAILABLE:
 FP16_LINEAR_KERNELS_AVAILABLE = find_spec(f"{__name__}._fp16_C") is not None
 if FP16_LINEAR_KERNELS_AVAILABLE:
     from . import _fp16_C  # noqa: F401
+
+# AOT artifacts can bypass pass initialization; register their optional ops
+# when loading the package rather than only from the compile pass.
+GEMMA_COMPILE_KERNELS_AVAILABLE = (
+    find_spec(f"{__name__}._gemma_compile_C") is not None
+)
+if GEMMA_COMPILE_KERNELS_AVAILABLE:
+    from . import _gemma_compile_C  # noqa: F401
