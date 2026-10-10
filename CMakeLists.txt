@@ -792,3 +792,27 @@ if(MOE_KERNELS_ENABLED)
     3
     WITH_SOABI)
 endif()
+
+option(GEMMA_COMPILE_KERNELS_ENABLED "Build Gemma decode fusion ops" ON)
+if(GEMMA_COMPILE_KERNELS_ENABLED)
+  define_gpu_extension_target(
+    _gemma_compile_C
+    DESTINATION
+    vllm_xpu_kernels
+    LANGUAGE
+    ${VLLM_GPU_LANG}
+    SOURCES
+    "csrc/gemma4_router_preprocess.cpp"
+    "csrc/gemma4_qkv_norm_rope.cpp"
+    COMPILE_FLAGS
+    ${VLLM_GPU_FLAGS}
+    -fno-fast-math
+    -ffp-contract=off
+    LINK_FLAGS
+    -fsycl
+    ARCHITECTURES
+    ${VLLM_GPU_ARCHES}
+    USE_SABI
+    3
+    WITH_SOABI)
+endif()
