@@ -11,3 +11,9 @@ GEMMA_COMPILE_KERNELS_AVAILABLE = (
 )
 if GEMMA_COMPILE_KERNELS_AVAILABLE:
     from . import _gemma_compile_C  # noqa: F401
+
+MOE_DECODE_KERNELS_AVAILABLE = (
+    find_spec(f"{__name__}._moe_decode_C") is not None
+)
+if MOE_DECODE_KERNELS_AVAILABLE:
+    from . import _moe_decode_C  # noqa: F401

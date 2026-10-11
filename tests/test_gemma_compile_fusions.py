@@ -112,3 +112,70 @@ def test_new_process_registers_ops_before_aot_loading():
         "assert hasattr(torch.ops._xpu_C,'gemma4_qkv_norm_rope')"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize(
+    "rows,width", [(1, 2816), (2, 2816), (8, 2816), (2, 5376)]
+)
+def test_restored_residual_norm_combinations(rows, width):
+    torch.manual_seed(110)
+    x = torch.randn(rows, width, device="xpu", dtype=torch.float16)
+    residual = torch.randn_like(x)
+    w1 = torch.randn(width, device="xpu", dtype=x.dtype)
+    w2 = torch.randn_like(w1)
+    expected_residual = norm(x, w1, 1e-6) + residual
+    expected = norm(expected_residual, w2, 1e-5)
+    y, r = torch.ops._xpu_C.gemma4_norm_add_norm(
+        x, residual, w1, w2, 1e-6, 1e-5
+    )
+    torch.testing.assert_close(y, expected, atol=4e-3, rtol=3e-3)
+    torch.testing.assert_close(r, expected_residual, atol=2e-3, rtol=3e-3)
+    scalar = torch.tensor(0.75, device="xpu", dtype=x.dtype)
+    expected_residual = (x + residual) * scalar
+    expected = norm(expected_residual, w2, 1e-6)
+    for op, arg in [
+        (torch.ops._xpu_C.gemma4_scaled_add_rms_norm, scalar),
+        (torch.ops._xpu_C.gemma4_scaled_add_rms_norm_scalar, 0.75),
+    ]:
+        y, r = op(x, residual, w2, 1e-6, arg)
+        torch.testing.assert_close(y, expected, atol=4e-3, rtol=3e-3)
+        torch.testing.assert_close(r, expected_residual, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8])
+def test_restored_router_moe_norm_and_routing(rows):
+    torch.manual_seed(120)
+    x = torch.randn(rows, 2816, device="xpu", dtype=torch.float16)
+    scale = torch.randn(2816, device="xpu", dtype=x.dtype)
+    mw = torch.randn_like(scale)
+    root = torch.tensor(2816**-0.5, device="xpu", dtype=x.dtype)
+    projection = torch.randn(128, 2816, device="xpu", dtype=x.dtype)
+    expected_logits = torch.nn.functional.linear(
+        norm(x, None, 1e-6) * root * scale, projection
+    ).float()
+    expected_moe = norm(x, mw, 1e-5)
+    logits, moe = torch.ops._xpu_C.gemma4_norm_router_moe(
+        x, scale, root, projection, mw, 1e-6, 1e-5
+    )
+    torch.testing.assert_close(logits, expected_logits, atol=4e-3, rtol=4e-3)
+    torch.testing.assert_close(moe, expected_moe, atol=4e-3, rtol=3e-3)
+    per_expert = torch.randn(128, device="xpu", dtype=x.dtype)
+    weights, ids = torch.ops._xpu_C.gemma4_small_m_topk(logits, per_expert, 8)
+    selected, ref_ids = logits.topk(8, dim=-1)
+    expected_weights = selected.softmax(-1) * per_expert[ref_ids].float()
+    torch.testing.assert_close(ids, ref_ids.to(torch.int32), atol=0, rtol=0)
+    torch.testing.assert_close(weights, expected_weights, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "rows,width", [(1, 352), (1, 1056), (8, 1056), (2, 4096), (2, 9216)]
+)
+def test_restored_gelu_mul_rounding(rows, width):
+    torch.manual_seed(131)
+    x = torch.randn(rows, 2 * width, device="xpu", dtype=torch.float16)
+    expected = (
+        torch.nn.functional.gelu(x[:, :width], approximate="tanh")
+        * x[:, width:]
+    )
+    actual = torch.ops._xpu_C.gemma4_gelu_tanh_and_mul(x)
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)

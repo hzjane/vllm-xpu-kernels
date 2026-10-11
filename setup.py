@@ -28,8 +28,7 @@ def load_module_from_path(module_name, path):
 ROOT_DIR = Path(__file__).parent
 logger = logging.getLogger(__name__)
 
-envs = load_module_from_path('envs', os.path.join(ROOT_DIR, 'tools',
-                                                  'envs.py'))
+envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "tools", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 
@@ -59,11 +58,11 @@ def is_url_available(url: str) -> bool:
 
 
 def get_oneapi_version() -> Version:
-    """Get the oneapi version from
-    """
+    """Get the oneapi version from"""
     assert SYCL_HOME is not None, "SYCL_HOME environment variable is not set."
-    icpx_output = subprocess.check_output([SYCL_HOME + "/bin/icpx", "-v"],
-                                          universal_newlines=True)
+    icpx_output = subprocess.check_output(
+        [SYCL_HOME + "/bin/icpx", "-v"], universal_newlines=True
+    )
     print("=============== icpx version ===============")
     print(f"sycl home: {SYCL_HOME}")
     print(icpx_output)
@@ -82,8 +81,7 @@ def _is_enabled(env_name: str, default: str = "ON") -> bool:
 
 
 class CMakeExtension(Extension):
-
-    def __init__(self, name: str, cmake_lists_dir: str = '.', **kwa) -> None:
+    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
         super().__init__(name, sources=[], py_limited_api=True, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
@@ -107,6 +105,7 @@ class cmake_build_ext(build_ext):
             # of memory, so we limit jobs to avoid OOM on memory-constrained
             # machines.
             import psutil
+
             mem_bytes = psutil.virtual_memory().total
 
             try:
@@ -154,38 +153,39 @@ class cmake_build_ext(build_ext):
         cfg = envs.CMAKE_BUILD_TYPE or default_cfg
 
         cmake_args = [
-            '-DCMAKE_BUILD_TYPE={}'.format(cfg),
-            '-DVLLM_TARGET_DEVICE={}'.format(VLLM_TARGET_DEVICE),
-            '-DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake'
+            "-DCMAKE_BUILD_TYPE={}".format(cfg),
+            "-DVLLM_TARGET_DEVICE={}".format(VLLM_TARGET_DEVICE),
+            "-DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake",
         ]
 
         verbose = envs.VERBOSE
         if verbose:
-            cmake_args += ['-DCMAKE_VERBOSE_MAKEFILE=ON']
+            cmake_args += ["-DCMAKE_VERBOSE_MAKEFILE=ON"]
 
         if is_sccache_available():
             cmake_args += [
-                '-DCMAKE_C_COMPILER_LAUNCHER=sccache',
-                '-DCMAKE_CXX_COMPILER_LAUNCHER=sccache',
+                "-DCMAKE_C_COMPILER_LAUNCHER=sccache",
+                "-DCMAKE_CXX_COMPILER_LAUNCHER=sccache",
             ]
         elif is_ccache_available():
             cmake_args += [
-                '-DCMAKE_C_COMPILER_LAUNCHER=ccache',
-                '-DCMAKE_CXX_COMPILER_LAUNCHER=ccache',
+                "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+                "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
             ]
 
         # Pass the python executable to cmake so it can find an exact
         # match.
-        cmake_args += ['-DVLLM_PYTHON_EXECUTABLE={}'.format(sys.executable)]
+        cmake_args += ["-DVLLM_PYTHON_EXECUTABLE={}".format(sys.executable)]
 
         # Pass the python path to cmake so it can reuse the build dependencies
         # on subsequent calls to python.
-        cmake_args += ['-DVLLM_PYTHON_PATH={}'.format(":".join(sys.path))]
+        cmake_args += ["-DVLLM_PYTHON_PATH={}".format(":".join(sys.path))]
 
         # Forward kernel build options to cmake so option() defaults are
         # overridden when the user sets environment variables.
         _kernel_options = [
             "GEMMA_COMPILE_KERNELS_ENABLED",
+            "MOE_DECODE_KERNELS_ENABLED",
             "BUILD_SYCL_TLA_KERNELS",
             "VLLM_XPU_ENABLE_XE2",
             "VLLM_XPU_ENABLE_XE_DEFAULT",
@@ -199,28 +199,35 @@ class cmake_build_ext(build_ext):
             "VLLM_XPU_ENABLE_ONEDNN",
         ]
         for opt in _kernel_options:
-            cmake_args.append('-D{}={}'.format(
-                opt, "ON" if _is_enabled(opt) else "OFF"))
+            cmake_args.append(
+                "-D{}={}".format(opt, "ON" if _is_enabled(opt) else "OFF")
+            )
 
         # XE3 (CRI/Xe3p) kernels are enabled by default, like XE2. Forward the
         # toggle so users can still disable them explicitly.
-        cmake_args.append('-DVLLM_XPU_ENABLE_XE3P={}'.format(
-            "ON" if _is_enabled("VLLM_XPU_ENABLE_XE3P", default="ON")
-            else "OFF"))
+        cmake_args.append(
+            "-DVLLM_XPU_ENABLE_XE3P={}".format(
+                "ON"
+                if _is_enabled("VLLM_XPU_ENABLE_XE3P", default="ON")
+                else "OFF"
+            )
+        )
 
         # Forward paged decode kernel config if set via environment variable.
         # Example: VLLM_PAGED_DECODE_CONFIG=llama pip install .
         _paged_decode_config = os.environ.get("VLLM_PAGED_DECODE_CONFIG", "")
         if _paged_decode_config:
             cmake_args.append(
-                '-DVLLM_PAGED_DECODE_CONFIG={}'.format(_paged_decode_config))
+                "-DVLLM_PAGED_DECODE_CONFIG={}".format(_paged_decode_config)
+            )
 
         # Forward chunk prefill kernel config if set via environment variable.
         # Example: VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_llama pip install .
         _chunk_prefill_config = os.environ.get("VLLM_CHUNK_PREFILL_CONFIG", "")
         if _chunk_prefill_config:
             cmake_args.append(
-                '-DVLLM_CHUNK_PREFILL_CONFIG={}'.format(_chunk_prefill_config))
+                "-DVLLM_CHUNK_PREFILL_CONFIG={}".format(_chunk_prefill_config)
+            )
 
         # Override the base directory for FetchContent downloads to $ROOT/.deps
         # This allows sharing dependencies between profiles,
@@ -228,7 +235,7 @@ class cmake_build_ext(build_ext):
         # To override this, set the FETCHCONTENT_BASE_DIR environment variable.
         fc_base_dir = os.path.join(ROOT_DIR, ".deps")
         fc_base_dir = os.environ.get("FETCHCONTENT_BASE_DIR", fc_base_dir)
-        cmake_args += ['-DFETCHCONTENT_BASE_DIR={}'.format(fc_base_dir)]
+        cmake_args += ["-DFETCHCONTENT_BASE_DIR={}".format(fc_base_dir)]
 
         #
         # Setup parallelism and build tool
@@ -236,17 +243,17 @@ class cmake_build_ext(build_ext):
         num_jobs = self.compute_num_jobs()
 
         if is_ninja_available():
-            build_tool = ['-G', 'Ninja']
+            build_tool = ["-G", "Ninja"]
             cmake_args += [
-                '-DCMAKE_JOB_POOL_COMPILE:STRING=compile',
-                '-DCMAKE_JOB_POOLS:STRING=compile={}'.format(num_jobs),
+                "-DCMAKE_JOB_POOL_COMPILE:STRING=compile",
+                "-DCMAKE_JOB_POOLS:STRING=compile={}".format(num_jobs),
             ]
         else:
             # Default build tool to whatever cmake picks.
             build_tool = []
         my_env = os.environ.copy()
-        icx_path = shutil.which('icx')
-        icpx_path = shutil.which('icpx')
+        icx_path = shutil.which("icx")
+        icpx_path = shutil.which("icpx")
         build_option_gpu = {
             "CMAKE_C_COMPILER": f"{icx_path}",
             "CMAKE_CXX_COMPILER": f"{icpx_path}",
@@ -255,16 +262,17 @@ class cmake_build_ext(build_ext):
             if value is not None:
                 cmake_args.append("-D{}={}".format(key, value))
         subprocess.check_call(
-            ['cmake', ext.cmake_lists_dir, *build_tool, *cmake_args],
+            ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
             cwd=self.build_temp,
-            env=my_env)
+            env=my_env,
+        )
 
     def build_extensions(self) -> None:
         # Ensure that CMake is present and working
         try:
-            subprocess.check_output(['cmake', '--version'])
+            subprocess.check_output(["cmake", "--version"])
         except OSError as e:
-            raise RuntimeError('Cannot find CMake executable') from e
+            raise RuntimeError("Cannot find CMake executable") from e
 
         # Create build directory if it does not exist.
         if not os.path.exists(self.build_temp):
@@ -306,12 +314,17 @@ class cmake_build_ext(build_ext):
             # CMake, this is currently true for current extensions but may not
             # always be the case.
             prefix = outdir
-            if '.' in ext.name:
+            if "." in ext.name:
                 prefix = prefix.parent
             # prefix here should actually be the same for all components
             install_args = [
-                "cmake", "--install", ".", "--prefix", prefix, "--component",
-                target_name(ext.name)
+                "cmake",
+                "--install",
+                ".",
+                "--prefix",
+                prefix,
+                "--component",
+                target_name(ext.name),
             ]
             subprocess.check_call(install_args, cwd=self.build_temp)
 
@@ -321,9 +334,10 @@ class cmake_build_ext(build_ext):
         if self.extensions:
             # Use the same prefix as the extensions
             first_ext = self.extensions[0]
-            outdir = Path(self.get_ext_fullpath(
-                first_ext.name)).parent.absolute()
-            prefix = outdir.parent if '.' in first_ext.name else outdir
+            outdir = Path(
+                self.get_ext_fullpath(first_ext.name)
+            ).parent.absolute()
+            prefix = outdir.parent if "." in first_ext.name else outdir
 
             for lib_name, file_path in additional_libraries.items():
                 install_args = [
@@ -337,11 +351,13 @@ class cmake_build_ext(build_ext):
                     "--verbose",
                 ]
                 try:
-                    subprocess.check_call(install_args,
-                                          cwd=self.build_temp + file_path)
+                    subprocess.check_call(
+                        install_args, cwd=self.build_temp + file_path
+                    )
                 except subprocess.CalledProcessError as e:
-                    logger.warning("Failed to install library %s: %s",
-                                   lib_name, e)
+                    logger.warning(
+                        "Failed to install library %s: %s", lib_name, e
+                    )
                     # Continue with other libraries even if one fails
 
     def run(self):
@@ -350,8 +366,10 @@ class cmake_build_ext(build_ext):
         super().run()
 
         import glob
+
         files = glob.glob(
-            os.path.join(self.build_lib, "vllm_xpu_kernels", "lib*.so"))
+            os.path.join(self.build_lib, "vllm_xpu_kernels", "lib*.so")
+        )
         # if is editable install, also copy to local inplace directory
         if self.inplace:
             for file in files:
@@ -378,8 +396,9 @@ class precompiled_wheel_utils:
                 wheel_filename = wheel_url_or_path.split("/")[-1]
                 temp_dir = tempfile.mkdtemp(prefix="vllm-wheels")
                 wheel_path = os.path.join(temp_dir, wheel_filename)
-                print(f"Downloading wheel from {wheel_url_or_path}"
-                      f"to {wheel_path}")
+                print(
+                    f"Downloading wheel from {wheel_url_or_path}to {wheel_path}"
+                )
                 from urllib.request import urlretrieve
 
                 urlretrieve(wheel_url_or_path, filename=wheel_path)
@@ -391,7 +410,8 @@ class precompiled_wheel_utils:
 
             with zipfile.ZipFile(wheel_path) as wheel:
                 file_members = [
-                    f for f in wheel.filelist
+                    f
+                    for f in wheel.filelist
                     if f.filename.startswith("vllm_xpu_kernels/")
                     and f.filename.endswith(".so")
                 ]
@@ -401,14 +421,15 @@ class precompiled_wheel_utils:
                     target_path = os.path.join(".", file.filename)
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     with (
-                            wheel.open(file.filename) as src,
-                            open(target_path, "wb") as dst,
+                        wheel.open(file.filename) as src,
+                        open(target_path, "wb") as dst,
                     ):
                         shutil.copyfileobj(src, dst)
 
                     pkg = os.path.dirname(file.filename).replace("/", ".")
                     package_data_patch.setdefault(pkg, []).append(
-                        os.path.basename(file.filename))
+                        os.path.basename(file.filename)
+                    )
 
             return package_data_patch
         finally:
@@ -425,11 +446,13 @@ class precompiled_wheel_utils:
 
         try:
             # Get the latest commit hash of the upstream main branch.
-            resp_json = subprocess.check_output([
-                "curl",
-                "-s",
-                "https://api.github.com/repos/vllm-project/vllm/commits/main",
-            ]).decode("utf-8")
+            resp_json = subprocess.check_output(
+                [
+                    "curl",
+                    "-s",
+                    "https://api.github.com/repos/vllm-project/vllm/commits/main",
+                ]
+            ).decode("utf-8")
             upstream_main_commit = json.loads(resp_json)["sha"]
 
             # In Docker build context, .git may be immutable or missing.
@@ -439,25 +462,42 @@ class precompiled_wheel_utils:
             # Check if the upstream_main_commit exists in the local repo
             try:
                 subprocess.check_output(
-                    ["git", "cat-file", "-e", f"{upstream_main_commit}"])
+                    ["git", "cat-file", "-e", f"{upstream_main_commit}"]
+                )
             except subprocess.CalledProcessError:
                 # If not present, fetch it from the remote repository.
                 # Note that this does not update any local branches,
                 # but ensures that this commit ref and its history are
                 # available in our local repo.
-                subprocess.check_call([
-                    "git", "fetch",
-                    "https://github.com/vllm-project/vllm-xpu-kernels", "main"
-                ])
+                subprocess.check_call(
+                    [
+                        "git",
+                        "fetch",
+                        "https://github.com/vllm-project/vllm-xpu-kernels",
+                        "main",
+                    ]
+                )
 
             # Then get the commit hash of the current branch that is the same as
             # the upstream main commit.
-            current_branch = (subprocess.check_output(
-                ["git", "branch", "--show-current"]).decode("utf-8").strip())
+            current_branch = (
+                subprocess.check_output(["git", "branch", "--show-current"])
+                .decode("utf-8")
+                .strip()
+            )
 
-            base_commit = (subprocess.check_output([
-                "git", "merge-base", f"{upstream_main_commit}", current_branch
-            ]).decode("utf-8").strip())
+            base_commit = (
+                subprocess.check_output(
+                    [
+                        "git",
+                        "merge-base",
+                        f"{upstream_main_commit}",
+                        current_branch,
+                    ]
+                )
+                .decode("utf-8")
+                .strip()
+            )
             return base_commit
         except ValueError as err:
             raise ValueError(err) from None
@@ -477,10 +517,13 @@ package_data = {
     ]
 }
 
-_SCM_TAG_REGEX = (r'^(?:[\w-]+-)?'
-                   r'(?P<version>[vV]?\d+(?:\.\d+)*'
-                   r'(?:[._-]?(?:dev|a|b|rc|alpha|beta)\d*)?)$')
+_SCM_TAG_REGEX = (
+    r"^(?:[\w-]+-)?"
+    r"(?P<version>[vV]?\d+(?:\.\d+)*"
+    r"(?:[._-]?(?:dev|a|b|rc|alpha|beta)\d*)?)$"
+)
 _SCM_DESCRIBE_CMD = "git describe --dirty --tags --long --match 'v*'"
+
 
 def get_vllm_version() -> str:
     # Allow overriding the version.
@@ -504,7 +547,7 @@ if envs.VLLM_USE_PRECOMPILED:
     print(f"version: get_vllm_version()={get_vllm_version()}")
     wheel_location = os.getenv(
         "VLLM_PRECOMPILED_WHEEL_LOCATION",
-        f"./vllm_xpu_kernels-{get_vllm_version()}-cp312-cp312-linux_x86_64.whl"
+        f"./vllm_xpu_kernels-{get_vllm_version()}-cp312-cp312-linux_x86_64.whl",
     )
     if wheel_location is not None:
         wheel_url = wheel_location
@@ -521,7 +564,7 @@ if envs.VLLM_USE_PRECOMPILED:
         base_commit = precompiled_wheel_utils.get_base_commit_in_main_branch()
         # TODO: update the URL when hosting the wheels
         wheel_url = "https://to-be-add.whl"
-        nightly_wheel_url = ("https://to-be-add.whl")
+        nightly_wheel_url = "https://to-be-add.whl"
         from urllib.request import urlopen
 
         try:
@@ -533,7 +576,8 @@ if envs.VLLM_USE_PRECOMPILED:
             wheel_url = nightly_wheel_url
 
     patch = precompiled_wheel_utils.extract_precompiled_and_patch_package(
-        wheel_url)
+        wheel_url
+    )
     for pkg, files in patch.items():
         package_data.setdefault(pkg, []).extend(files)
 
@@ -562,29 +606,44 @@ if _is_enabled("BUILD_SYCL_TLA_KERNELS"):
             additional_libraries["attn_kernels_xe_2"] = "/csrc/xpu/attn/xe_2"
         if _is_enabled("GDN_KERNELS_ENABLED"):
             additional_libraries["gdn_attn_kernels_xe_2"] = (
-                "/csrc/xpu/gdn_attn/xe_2")
+                "/csrc/xpu/gdn_attn/xe_2"
+            )
         if _is_enabled("MQA_LOGITS_KERNELS_ENABLED"):
             additional_libraries["mqa_logits_kernels_xe_2"] = (
-                "/csrc/xpu/mqa_logits/xe_2")
+                "/csrc/xpu/mqa_logits/xe_2"
+            )
         if _is_enabled("MHC_KERNELS_ENABLED"):
-            additional_libraries["mhc_kernels_xe_2"] = (
-                "/csrc/xpu/mhc/xe_2")
+            additional_libraries["mhc_kernels_xe_2"] = "/csrc/xpu/mhc/xe_2"
         if _is_enabled("MOE_KERNELS_ENABLED"):
             additional_libraries["grouped_gemm_xe_2"] = (
-                "/csrc/xpu/grouped_gemm/xe_2")
+                "/csrc/xpu/grouped_gemm/xe_2"
+            )
     # Attention-only XE3 upstreaming: the XE3 grouped_gemm / quant_asm
     # components are intentionally not wired here.
     if _is_enabled("VLLM_XPU_ENABLE_XE3P", default="ON") and _is_enabled(
-            "FA2_KERNELS_ENABLED"):
+        "FA2_KERNELS_ENABLED"
+    ):
         additional_libraries["attn_kernels_xe_3"] = "/csrc/xpu/attn/xe_3"
     if _is_enabled("VLLM_XPU_ENABLE_XE_DEFAULT") and _is_enabled(
-            "MOE_KERNELS_ENABLED"):
+        "MOE_KERNELS_ENABLED"
+    ):
         additional_libraries["grouped_gemm_xe_default"] = (
-            "/csrc/xpu/grouped_gemm/xe_default")
+            "/csrc/xpu/grouped_gemm/xe_default"
+        )
+
+cmdclass = {}
 
 if _build_custom_ops():
+    if _is_enabled("MOE_DECODE_KERNELS_ENABLED") and _is_enabled(
+        "BUILD_SYCL_TLA_KERNELS"
+    ):
+        ext_modules.append(
+            CMakeExtension(name="vllm_xpu_kernels._moe_decode_C")
+        )
     if _is_enabled("GEMMA_COMPILE_KERNELS_ENABLED"):
-        ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._gemma_compile_C"))
+        ext_modules.append(
+            CMakeExtension(name="vllm_xpu_kernels._gemma_compile_C")
+        )
     if _is_enabled("BASIC_KERNELS_ENABLED"):
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._C"))
     if _is_enabled("FA2_KERNELS_ENABLED"):
@@ -595,12 +654,14 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm_xpu_kernels._xpu_C"))
     if _is_enabled("XPUMEM_ALLOCATOR_ENABLED"):
         ext_modules.append(
-            CMakeExtension(name="vllm_xpu_kernels.xpumem_allocator"))
+            CMakeExtension(name="vllm_xpu_kernels.xpumem_allocator")
+        )
 
 if ext_modules:
     cmdclass = {
-        "build_ext":
-        precompiled_build_ext if envs.VLLM_USE_PRECOMPILED else cmake_build_ext
+        "build_ext": precompiled_build_ext
+        if envs.VLLM_USE_PRECOMPILED
+        else cmake_build_ext
     }
 
 setup(
