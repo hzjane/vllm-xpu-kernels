@@ -51,7 +51,8 @@ CUTE_DEVICE void xe_gemm_gate_up(
     const ElementBI* Bias,
     DTensor& C,  // (M,N)
     Coord<int, int, cute::Underscore, int> blk_coord,
-    TiledMMA const& mma) {
+    TiledMMA const& mma,
+    int intermediate_size = 352) {
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -73,7 +74,7 @@ CUTE_DEVICE void xe_gemm_gate_up(
   Tensor gBU = local_tile(
       cB,
       select<1, 2>(wg_tile),
-      make_coord(wg_n + 352 / int(get<1>(wg_tile)), _));
+      make_coord(wg_n + intermediate_size / int(get<1>(wg_tile)), _));
   Tensor gC =
       local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});  // (BLK_M,BLK_N)
 

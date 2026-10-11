@@ -32,6 +32,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <cstring>
+
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
@@ -622,10 +625,18 @@ class ReduceSplitK {
  public:
   static Params
   to_underlying_arguments(Arguments const& args, void* workspace) {
+    // Explicit opt-in; untiled defaults preserve the existing dispatch.
+    const char* flag = std::getenv("VLLM_XPU_GEMMA_SPLITK_HD_TILING");
+    const bool enabled = flag != nullptr && std::strcmp(flag, "1") == 0;
+    const int num_hd_tiles = enabled ? cute::max(1, num_vals_per_thread) : 1;
     return {
         args.kernel,
         TileScheduler::to_underlying_arguments(
-            args.kernel.shape, args.hw_info, TileShapeO{}, args.num_kv_splits)};
+            args.kernel.shape,
+            args.hw_info,
+            TileShapeO{},
+            args.num_kv_splits,
+            num_hd_tiles)};
   }
 
   static bool can_implement(Arguments const& args) {
@@ -691,9 +702,11 @@ class ReduceSplitK {
     auto num_heads_q = s.num_heads_q;
     auto head_size_vo = s.head_size_vo;
 
+    const int num_hd_tiles = cute::max(1, params.scheduler.num_hd_tiles);
     CUTLASS_PRAGMA_NO_UNROLL
     for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-      auto [seq_idx, head_q, idx_b] = tile_scheduler.get_block_coord();
+      auto [seq_idx, head_q, idx_b, hd_tile_idx] =
+          tile_scheduler.get_block_coord();
 
       // Skip prefill batches when is_prefill mask is provided
       if (p.is_prefill != nullptr && p.is_prefill[idx_b]) continue;
@@ -843,7 +856,7 @@ class ReduceSplitK {
             local_weight * inv_lse_exp_sum;
       }
 
-      if (p.softmax_lse != nullptr && thr_id == 0) {
+      if (p.softmax_lse != nullptr && thr_id == 0 && hd_tile_idx == 0) {
         int global_q = seq_idx;
         if constexpr (is_var_len) {
           global_q += s.seq_len_qo.cumulative_length[idx_b];
@@ -857,7 +870,11 @@ class ReduceSplitK {
 
       sycl::group_barrier(get_work_group<3>());
 
-      for (int idx = thr_id; idx < s.head_size_vo;
+      // Distinct head-dimension tiles own disjoint output columns.
+      const int tile_size = cute::ceil_div(int(s.head_size_vo), num_hd_tiles);
+      const int hd_begin = hd_tile_idx * tile_size;
+      const int hd_end = cute::min(hd_begin + tile_size, int(s.head_size_vo));
+      for (int idx = hd_begin + thr_id; idx < hd_end;
            idx += SGPerWG::value * intel::sg_size) {
         ElementLSE acc = 0;
         for (int i = 0; i < effective_splits; ++i) {

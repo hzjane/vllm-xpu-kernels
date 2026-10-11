@@ -798,6 +798,7 @@ if(GEMMA_COMPILE_KERNELS_ENABLED)
     "csrc/gemma_norm_fusions.cpp"
     "csrc/gemma_decode_fusions.cpp"
     "csrc/gemma4_aggregate.cpp"
+    "csrc/gemma4_router_fusion.cpp"
     COMPILE_FLAGS
     ${VLLM_GPU_FLAGS}
     -fno-fast-math

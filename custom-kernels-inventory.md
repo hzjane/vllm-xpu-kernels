@@ -13,12 +13,16 @@
 | gemma4_gelu_tanh_and_mul | GELU-tanh与up相乘，保留GELU FP16中间舍入；用于完整dense MLP |
 | gemma4_small_m_topk | E128/top8，softmax/renormalization/expert scale；精确signed-key tie-break；FP16/FP32 logits，M1..8 |
 | fp8_moe_decode | 完整routed expert gate/up、GELU、down、weighted gather；FP8 per-expert scales、FP16 H2816/I352/E128/top8、M1..8；可选BMG原生try-op，unsupported在enqueue前返回false |
+| gemma4_norm_router_topk | 一次launch完成Router/MoE共享variance、root/channel scale、projection、top-k、expert-scale；H2816/E128/M1..8 |
+| gemma4_residual_norm_router_topk | 一次launch完成post-attn norm、residual add、dense/MoE/Router三路norm、projection和routing；保留residual输出与分步FP16舍入 |
+| fp8_moe_dense_decode | routed和dense在共同gate/up＋GELU grid与共同down grid执行，第三次launch做routed gather；独立两支输出/TP/post norm；M1..4、dense I1056、routed I352；M5..8提交前返回false |
 
-以上为9个native接口，使用当前XPU stream、局部scratch与Meta。增量模块为_gemma_compile_C和_moe_decode_C。
+以上为12个native接口，使用当前XPU stream、局部scratch与Meta。增量模块为_gemma_compile_C和_moe_decode_C。
 
 | Kernel-only开启方式 | 计算 |
 | --- | --- |
 | VLLM_XPU_GEMMA_DECODE_ATTENTION=1 | retained small-query causal metadata、paged decode分派、局部window与split policy；现有ABI |
+| VLLM_XPU_GEMMA_SPLITK_HD_TILING=1 | paged decode split-K reduce按head_dim分块，LSE只由tile0写；参考yc #630，现有attention ABI |
 | VLLM_XPU_GEMMA_CACHE_GRF256=1 | 非量化FP16/D512/KV2、M1..8、page64/128的strided KV writer GRF256；现有ABI |
 
 环境开关默认关闭，shape/dtype/layout检查保持。没有普通FP8/FP16 Linear、LM head/draft纯矩阵替换，也没有旧Diffusion启用。历史独立GELU/ROPE/weightless RMS计算已纳入完整组合；不复制已被组合覆盖的prepare/gather接口或重复upstream global tile256。

@@ -279,7 +279,7 @@ void launch(
       });
 }
 
-bool experts(
+bool expert_inputs_supported(
     at::Tensor output,
     const at::Tensor& input,
     const at::Tensor& w13,
@@ -323,6 +323,20 @@ bool experts(
       reinterpret_cast<uintptr_t>(w13.data_ptr()) % 64 ||
       reinterpret_cast<uintptr_t>(w2.data_ptr()) % 64)
     return false;
+  return true;
+}
+
+bool experts(
+    at::Tensor output,
+    const at::Tensor& input,
+    const at::Tensor& w13,
+    const at::Tensor& s13,
+    const at::Tensor& w2,
+    const at::Tensor& s2,
+    const at::Tensor& weights,
+    const at::Tensor& ids) {
+  if (!expert_inputs_supported(output, input, w13, s13, w2, s2, weights, ids))
+    return false;
   const c10::DeviceGuard guard(input.device());
   // M<=4: direct routes avoid all packing. M>=5: group common experts so their
   // weight tiles can be reused; one prepare builds the map for both GEMMs.
@@ -334,17 +348,274 @@ bool experts(
     launch<true, 4>(output, input, w13, s13, w2, s2, weights, ids);
   return true;
 }
+template <bool Gate>
+class DenseRoutedGemm;
+
+// The two branches share the launch/grid, but not inputs, weights, outputs,
+// normalization, or TP reductions. Reuse the existing SYCL-TLA mainloop.
+template <bool Gate>
+void gemm_dense_routed(
+    sycl::queue& q,
+    const at::Tensor& routed_input,
+    const at::Tensor& dense_input,
+    const at::Tensor& routed_weight,
+    const at::Tensor& dense_weight,
+    const at::Tensor& routed_scale,
+    const at::Tensor& dense_scale,
+    const at::Tensor& ids,
+    at::Tensor& routed_output,
+    at::Tensor& dense_output) {
+  using Policy =
+      std::conditional_t<Gate, GateUpPolicy<0>, MoE::w8a16_policy_m_8>;
+  using Tile = typename Policy::WGTile;
+  using MMA = typename TiledMMAHelper<
+      MMA_Atom<XE_DPAS_TT<8, float, cutlass::half_t>>,
+      Layout<Tile>,
+      typename Policy::SGLayout>::TiledMMA;
+  const auto mma = MMA{};
+  constexpr int routed_k = Gate ? 2816 : 352;
+  constexpr int routed_n = Gate ? 704 : 2816;
+  constexpr int routed_d = Gate ? 352 : 2816;
+  constexpr int dense_k = Gate ? 2816 : 1056;
+  constexpr int dense_n = Gate ? 2112 : 2816;
+  constexpr int dense_d = Gate ? 1056 : 2816;
+  constexpr int tile_n = Gate ? 32 : 64;
+  const int m = dense_input.size(0), threads = size(mma);
+  const int routed_tiles = m * 8 * (routed_d / tile_n);
+  const int dense_tiles = dense_d / tile_n;
+  const auto* ra =
+      reinterpret_cast<const cutlass::half_t*>(routed_input.data_ptr());
+  const auto* da =
+      reinterpret_cast<const cutlass::half_t*>(dense_input.data_ptr());
+  const auto* rb =
+      reinterpret_cast<const cutlass::float_e4m3_t*>(routed_weight.data_ptr());
+  const auto* db =
+      reinterpret_cast<const cutlass::float_e4m3_t*>(dense_weight.data_ptr());
+  const auto* rs = routed_scale.data_ptr<float>();
+  const auto* ds = dense_scale.data_ptr<float>();
+  const auto* experts = ids.data_ptr<int>();
+  auto* ro = reinterpret_cast<cutlass::half_t*>(routed_output.data_ptr());
+  auto* dout = reinterpret_cast<cutlass::half_t*>(dense_output.data_ptr());
+  namespace sx = sycl::ext::oneapi::experimental;
+  sx::properties props{
+      sx::sub_group_size<16>, sycl::ext::intel::experimental::grf_size<256>};
+  const sycl::range<3> local(1, 1, threads);
+  q.submit([&](sycl::handler& h) {
+    h.parallel_for<DenseRoutedGemm<Gate>>(
+        sycl::nd_range<3>(
+            sycl::range<3>(1, 1, routed_tiles + dense_tiles) * local, local),
+        props,
+        [=](sycl::nd_item<3> it) {
+          const int group = it.get_group(2);
+          const cutlass::half_t* bias = nullptr;
+          if (group < routed_tiles) {
+            const int route = group / (routed_d / tile_n);
+            const int tile = group % (routed_d / tile_n);
+            const int expert = experts[route];
+            if (expert < 0 || expert >= 128) {
+              for (int n = it.get_local_linear_id(); n < tile_n; n += threads)
+                ro[route * routed_d + tile * tile_n + n] = cutlass::half_t(0.f);
+              return;
+            }
+            const int row = Gate ? route / 8 : route;
+            auto A = MoE::make_moe_tensor<cutlass::half_t, 'R'>(
+                const_cast<cutlass::half_t*>(ra) + row * routed_k, 1, routed_k);
+            auto B = MoE::make_moe_tensor<cutlass::float_e4m3_t, 'C'>(
+                const_cast<cutlass::float_e4m3_t*>(rb) +
+                    int64_t(expert) * routed_k * routed_n,
+                routed_n,
+                routed_k);
+            auto C = MoE::make_moe_tensor<cutlass::half_t, 'R'>(
+                ro + route * routed_d, 1, routed_d);
+            if constexpr (Gate)
+              MoE::xe_gemm_gate_up<
+                  typename Policy::GmemTiledCopyA,
+                  typename Policy::GmemTiledCopyB,
+                  typename Policy::GmemTiledCopyD>(
+                  A, B, rs + expert, bias, C, make_coord(0, tile, _, 0), mma);
+            else
+              MoE::xe_gemm<
+                  typename Policy::GmemTiledCopyA,
+                  typename Policy::GmemTiledCopyB,
+                  typename Policy::GmemTiledCopyD>(
+                  A, B, rs + expert, bias, C, make_coord(0, tile, _, 0), mma);
+          } else {
+            const int tile = group - routed_tiles;
+            auto A = MoE::make_moe_tensor<cutlass::half_t, 'R'>(
+                const_cast<cutlass::half_t*>(da), m, dense_k);
+            // Existing dense weights are transposed views of [N,K]. Keep
+            // that layout; no per-token repack or stale weight cache.
+            auto B = MoE::make_moe_tensor<cutlass::float_e4m3_t, 'R'>(
+                const_cast<cutlass::float_e4m3_t*>(db), dense_n, dense_k);
+            auto C =
+                MoE::make_moe_tensor<cutlass::half_t, 'R'>(dout, m, dense_d);
+            if constexpr (Gate)
+              MoE::xe_gemm_gate_up<
+                  typename Policy::GmemTiledCopyA,
+                  typename Policy::GmemTiledCopyB,
+                  typename Policy::GmemTiledCopyD>(
+                  A, B, ds, bias, C, make_coord(0, tile, _, 0), mma, dense_d);
+            else
+              MoE::xe_gemm<
+                  typename Policy::GmemTiledCopyA,
+                  typename Policy::GmemTiledCopyB,
+                  typename Policy::GmemTiledCopyD>(
+                  A, B, ds, bias, C, make_coord(0, tile, _, 0), mma);
+          }
+        });
+  });
+}
+
+bool dense_routed(
+    at::Tensor dense_output,
+    at::Tensor routed_output,
+    const at::Tensor& dense_input,
+    const at::Tensor& routed_input,
+    const at::Tensor& dense_gate_weight,
+    const at::Tensor& dense_gate_scale,
+    const at::Tensor& dense_down_weight,
+    const at::Tensor& dense_down_scale,
+    const at::Tensor& w13,
+    const at::Tensor& s13,
+    const at::Tensor& w2,
+    const at::Tensor& s2,
+    const at::Tensor& weights,
+    const at::Tensor& ids) {
+  if (!expert_inputs_supported(
+          routed_output, routed_input, w13, s13, w2, s2, weights, ids) ||
+      routed_input.size(0) > 4 || dense_input.sizes() != routed_input.sizes() ||
+      dense_output.sizes() != dense_input.sizes() ||
+      dense_input.scalar_type() != at::kHalf ||
+      dense_output.scalar_type() != at::kHalf ||
+      dense_gate_weight.scalar_type() != at::kFloat8_e4m3fn ||
+      dense_down_weight.scalar_type() != at::kFloat8_e4m3fn ||
+      dense_gate_weight.sizes() != at::IntArrayRef({2816, 2112}) ||
+      dense_down_weight.sizes() != at::IntArrayRef({1056, 2816}) ||
+      dense_gate_weight.stride(0) != 1 || dense_gate_weight.stride(1) != 2816 ||
+      dense_down_weight.stride(0) != 1 || dense_down_weight.stride(1) != 1056 ||
+      dense_gate_scale.scalar_type() != at::kFloat ||
+      dense_gate_scale.numel() != 1 ||
+      dense_down_scale.scalar_type() != at::kFloat ||
+      dense_down_scale.numel() != 1 || !dense_input.is_contiguous() ||
+      !dense_output.is_contiguous() || !dense_gate_scale.is_contiguous() ||
+      !dense_down_scale.is_contiguous())
+    return false;
+  for (const auto& t :
+       {dense_input,
+        dense_output,
+        dense_gate_weight,
+        dense_gate_scale,
+        dense_down_weight,
+        dense_down_scale}) {
+    if (t.device() != routed_input.device() ||
+        reinterpret_cast<uintptr_t>(t.data_ptr()) % 64)
+      return false;
+    if (t.is_alias_of(routed_output)) return false;
+  }
+  for (const auto& t :
+       {dense_input,
+        routed_input,
+        dense_gate_weight,
+        dense_gate_scale,
+        dense_down_weight,
+        dense_down_scale,
+        w13,
+        s13,
+        w2,
+        s2,
+        weights,
+        ids,
+        routed_output})
+    if (dense_output.is_alias_of(t)) return false;
+  const c10::DeviceGuard guard(routed_input.device());
+  const int m = dense_input.size(0);
+  auto routed_activation = at::empty({m * 8, 352}, routed_input.options());
+  auto dense_activation = at::empty({m, 1056}, dense_input.options());
+  auto partial = at::empty({m * 8, 2816}, routed_input.options());
+  auto& q = c10::xpu::getCurrentXPUStream(routed_input.get_device()).queue();
+  gemm_dense_routed<true>(
+      q,
+      routed_input,
+      dense_input,
+      w13,
+      dense_gate_weight,
+      s13,
+      dense_gate_scale,
+      ids,
+      routed_activation,
+      dense_activation);
+  gemm_dense_routed<false>(
+      q,
+      routed_activation,
+      dense_activation,
+      w2,
+      dense_down_weight,
+      s2,
+      dense_down_scale,
+      ids,
+      partial,
+      dense_output);
+  const auto* src = reinterpret_cast<const Half8*>(partial.data_ptr());
+  auto* dst = reinterpret_cast<Half8*>(routed_output.data_ptr());
+  const auto* route_weights = weights.data_ptr<float>();
+  q.parallel_for(
+      sycl::nd_range<2>({size_t(m), 352}, {1, 32}),
+      [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int row = it.get_group(0), col = it.get_global_id(1);
+        float sum[8] = {};
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          const Half8 x = src[(row * 8 + k) * 352 + col];
+#pragma unroll
+          for (int i = 0; i < 8; ++i)
+            sum[i] += float(x.v[i]) * route_weights[row * 8 + k];
+        }
+        Half8 x;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          x.v[i] = sycl::half(sum[i]);
+        dst[row * 352 + col] = x;
+      });
+  return true;
+}
+
 TORCH_LIBRARY_FRAGMENT(_xpu_C, m) {
   m.def(
       "fp8_moe_decode(Tensor(a!) output, Tensor input, Tensor w13, Tensor s13, "
       "Tensor w2, Tensor s2, Tensor weights, Tensor ids) -> bool");
+  m.def(
+      "fp8_moe_dense_decode(Tensor(a!) dense_output, Tensor(b!) routed_output, "
+      "Tensor dense_input, Tensor routed_input, Tensor dense_gate_weight, "
+      "Tensor dense_gate_scale, Tensor dense_down_weight, Tensor "
+      "dense_down_scale, "
+      "Tensor w13, Tensor s13, Tensor w2, Tensor s2, Tensor weights, Tensor "
+      "ids) -> bool");
 }
-TORCH_LIBRARY_IMPL(_xpu_C, XPU, m) { m.impl("fp8_moe_decode", &experts); }
+TORCH_LIBRARY_IMPL(_xpu_C, XPU, m) {
+  m.impl("fp8_moe_decode", &experts);
+  m.impl("fp8_moe_dense_decode", &dense_routed);
+}
 // This try-op permits the pre-existing experts path during FakeTensor tracing.
 TORCH_LIBRARY_IMPL(_xpu_C, Meta, m) {
   m.impl(
       "fp8_moe_decode",
       [](at::Tensor,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&) { return false; });
+  m.impl(
+      "fp8_moe_dense_decode",
+      [](at::Tensor,
+         at::Tensor,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
+         const at::Tensor&,
          const at::Tensor&,
          const at::Tensor&,
          const at::Tensor&,
