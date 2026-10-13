@@ -2,6 +2,7 @@
 #include "xpu/ops.h"
 #ifdef VLLM_MOE_ENABLED
   #include "xpu/grouped_gemm/grouped_gemm_interface.h"
+  #include "xpu/grouped_gemm/gemma_moe_fused_interface.h"
 #endif
 #include "xpu/lora/lora_ops.h"
 
@@ -56,6 +57,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
 #ifdef VLLM_MOE_ENABLED
+  xpu_ops.def(
+      "gemma_moe_fused_decode_interface(Tensor(a!) output, Tensor x, "
+      "Tensor topk_weights, Tensor topk_ids, Tensor w13, Tensor s13, "
+      "Tensor w2, Tensor s2, Tensor(b!) workspace) -> ()");
+  xpu_ops.impl(
+      "gemma_moe_fused_decode_interface",
+      torch::kXPU,
+      &gemma_moe_fused_decode_interface);
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
       "Tensor ptr_B, Tensor? ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "
