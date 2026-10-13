@@ -58,6 +58,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
 
 #ifdef VLLM_MOE_ENABLED
   xpu_ops.def(
+      "gemma_moe_topk_interface(Tensor logits, Tensor per_expert_scale, int "
+      "topk) -> (Tensor, Tensor)");
+  xpu_ops.impl(
+      "gemma_moe_topk_interface", torch::kXPU, &gemma_moe_topk_interface);
+  xpu_ops.def(
       "gemma_moe_fused_decode_interface(Tensor(a!) output, Tensor x, "
       "Tensor topk_weights, Tensor topk_ids, Tensor w13, Tensor s13, "
       "Tensor w2, Tensor s2, Tensor(b!) workspace) -> ()");

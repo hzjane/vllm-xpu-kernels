@@ -12,3 +12,8 @@ void gemma_moe_fused_decode_interface(
     const torch::Tensor& w2,
     const torch::Tensor& s2,
     torch::Tensor& workspace);
+
+std::tuple<torch::Tensor, torch::Tensor> gemma_moe_topk_interface(
+    const torch::Tensor& logits,
+    const torch::Tensor& per_expert_scale,
+    int64_t topk);

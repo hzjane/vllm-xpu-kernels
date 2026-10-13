@@ -177,13 +177,15 @@ def test_bad_workspace_count_rejected(m):
 
 @pytest.mark.parametrize("index", range(9))
 @pytest.mark.parametrize("destination", ["cpu", "xpu:1"])
-def test_every_argument_rejects_foreign_device(expert_weights, index,
-                                              destination):
+def test_every_argument_rejects_foreign_device(
+    expert_weights, index, destination
+):
     _, parameters = expert_weights
     x, weights, ids = (t.to("xpu:0") for t in inputs(1, torch.float16))
     output = torch.full_like(x, 3)
-    workspace = torch.zeros(workspace_bytes(1), device="xpu:0",
-                            dtype=torch.uint8)
+    workspace = torch.zeros(
+        workspace_bytes(1), device="xpu:0", dtype=torch.uint8
+    )
     args = [output, x, weights, ids, *parameters, workspace]
     args[index] = args[index].to(destination)
     before = args[0].clone()
@@ -191,3 +193,129 @@ def test_every_argument_rejects_foreign_device(expert_weights, index,
         torch.ops._xpu_C.gemma_moe_fused_decode_interface(*args)
     torch.xpu.synchronize()
     torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+
+def routing_reference(logits, scales):
+    values = logits.float()
+    bits = values.view(torch.int32)
+    key = torch.where(bits < 0, bits ^ -2147483648, bits ^ -1)
+    packed = ((key.long() & 0xFFFFFFFF) << 32) | torch.arange(128)
+    ids = packed.argsort(dim=-1)[:, :8].int()
+    selected = values.gather(1, ids.long())
+    raw = torch.exp2(
+        (selected - values.amax(1, keepdim=True)) * 1.4426950408889634
+    )
+    weights = raw / raw.sum(1, keepdim=True) * scales.float()[ids.long()]
+    return weights, ids
+
+
+@pytest.mark.parametrize("m", [1, 4, 5, 8])
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_routing_matches_cpu_math_and_tie_order(m, dtype):
+    g = torch.Generator().manual_seed(917 + m)
+    logits = torch.randn(m, 128, generator=g).to(dtype)
+    logits[:, :16] = 4  # Equal maxima must select ascending expert IDs.
+    scales = (torch.rand(128, generator=g) + 0.5).to(dtype)
+    expected_weights, expected_ids = routing_reference(logits, scales)
+    weights, ids = torch.ops._xpu_C.gemma_moe_topk_interface(
+        logits.xpu(), scales.xpu(), 8
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(
+        weights.cpu(), expected_weights, rtol=1e-5, atol=1e-6
+    )
+
+
+@pytest.mark.parametrize("pattern", ["random", "signed_zero", "large"])
+@pytest.mark.parametrize(
+    "scale_dtype", [torch.float16, torch.bfloat16, torch.float32]
+)
+def test_routing_fp32_logits_with_active_scale_dtypes(pattern, scale_dtype):
+    g = torch.Generator().manual_seed(7123)
+    logits = torch.randn(8, 128, generator=g)
+    if pattern == "signed_zero":
+        logits.zero_()
+        logits[:, 1::2] = -0.0
+    if pattern == "large":
+        logits *= 1000
+    scales = (torch.rand(128, generator=g) + 0.5).to(scale_dtype)
+    ew, ei = routing_reference(logits, scales)
+    w, ids = torch.ops._xpu_C.gemma_moe_topk_interface(
+        logits.xpu(), scales.xpu(), 8
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(ids.cpu(), ei, rtol=0, atol=0)
+    torch.testing.assert_close(w.cpu(), ew, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "m0",
+        "m9",
+        "experts",
+        "topk",
+        "logits_dtype",
+        "scale_dtype",
+        "scale_shape",
+        "strided",
+        "cpu_logits",
+        "cpu_scale",
+        "foreign_scale",
+    ],
+)
+def test_routing_rejects_unsupported_inputs(case):
+    logits = torch.zeros(1, 128, device="xpu:0")
+    scale = torch.ones(128, device="xpu:0")
+    topk = 8
+    if case in ("m0", "m9"):
+        logits = torch.zeros(0 if case == "m0" else 9, 128, device="xpu:0")
+    if case == "experts":
+        logits = logits[:, :127].contiguous()
+    if case == "topk":
+        topk = 7
+    if case == "logits_dtype":
+        logits = logits.double()
+    if case == "scale_dtype":
+        scale = scale.double()
+    if case == "scale_shape":
+        scale = scale.reshape(1, 128)
+    if case == "strided":
+        scale = torch.ones(256, device="xpu:0")[::2]
+    if case == "cpu_logits":
+        logits = logits.cpu()
+    if case == "cpu_scale":
+        scale = scale.cpu()
+    if case == "foreign_scale":
+        scale = scale.to("xpu:1")
+    with pytest.raises(RuntimeError):
+        torch.ops._xpu_C.gemma_moe_topk_interface(logits, scale, topk)
+
+
+@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("scale_dtype", [torch.float16, torch.bfloat16])
+def test_routing_current_stream_graph_replays_active_scales(m, scale_dtype):
+    logits = torch.randn(m, 128, device="xpu:0")
+    scales = torch.ones(128, device="xpu:0", dtype=scale_dtype)
+    stream = torch.xpu.Stream(device=0)
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.stream(stream):
+        torch.ops._xpu_C.gemma_moe_topk_interface(logits, scales, 8)
+    stream.synchronize()
+    with torch.xpu.graph(graph, stream=stream):
+        weights, ids = torch.ops._xpu_C.gemma_moe_topk_interface(
+            logits, scales, 8
+        )
+    for shift in [1.0, -0.5]:
+        with torch.xpu.stream(stream):
+            logits.copy_(torch.roll(logits, 11, dims=1))
+            scales.add_(shift)
+            graph.replay()
+            actual_w, actual_i = weights.clone(), ids.clone()
+        stream.synchronize()
+        ew, ei = routing_reference(logits.cpu(), scales.cpu())
+        torch.testing.assert_close(actual_i.cpu(), ei, rtol=0, atol=0)
+        torch.testing.assert_close(actual_w.cpu(), ew, rtol=1e-5, atol=1e-6)
