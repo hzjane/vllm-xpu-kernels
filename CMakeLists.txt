@@ -778,3 +778,36 @@ if(MOE_KERNELS_ENABLED)
     3
     WITH_SOABI)
 endif()
+
+option(MOE_DECODE_KERNELS_ENABLED "Build complete Gemma routed experts" ON)
+if(MOE_DECODE_KERNELS_ENABLED AND BUILD_SYCL_TLA_KERNELS)
+  include(csrc/xpu/moe_decode/CMakeLists.txt)
+endif()
+
+option(GEMMA_COMPILE_KERNELS_ENABLED "Build Gemma decode fusion ops" ON)
+if(GEMMA_COMPILE_KERNELS_ENABLED)
+  define_gpu_extension_target(
+    _gemma_compile_C
+    DESTINATION
+    vllm_xpu_kernels
+    LANGUAGE
+    ${VLLM_GPU_LANG}
+    SOURCES
+    "csrc/gemma4_router_preprocess.cpp"
+    "csrc/gemma4_qkv_norm_rope.cpp"
+    "csrc/gemma_norm_fusions.cpp"
+    "csrc/gemma_decode_fusions.cpp"
+    "csrc/gemma4_aggregate.cpp"
+    "csrc/gemma4_router_fusion.cpp"
+    COMPILE_FLAGS
+    ${VLLM_GPU_FLAGS}
+    -fno-fast-math
+    -ffp-contract=off
+    LINK_FLAGS
+    -fsycl
+    ARCHITECTURES
+    ${VLLM_GPU_ARCHES}
+    USE_SABI
+    3
+    WITH_SOABI)
+endif()
