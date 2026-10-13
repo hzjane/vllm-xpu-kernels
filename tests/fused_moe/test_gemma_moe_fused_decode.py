@@ -160,6 +160,7 @@ def test_rejects_before_output_write(expert_weights, case):
     torch.testing.assert_close(output, before, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(torch.xpu.device_count() < 2, reason="Two XPUs required")
 def test_workspace_bound_to_weights_device(expert_weights):
     _, gpu = expert_weights
     plan = XpuGemmaMoEFusedDecode(*gpu)
@@ -176,7 +177,18 @@ def test_bad_workspace_count_rejected(m):
 
 
 @pytest.mark.parametrize("index", range(9))
-@pytest.mark.parametrize("destination", ["cpu", "xpu:1"])
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "cpu",
+        pytest.param(
+            "xpu:1",
+            marks=pytest.mark.skipif(
+                torch.xpu.device_count() < 2, reason="Two XPUs required"
+            ),
+        ),
+    ],
+)
 def test_every_argument_rejects_foreign_device(
     expert_weights, index, destination
 ):
@@ -264,7 +276,12 @@ def test_routing_fp32_logits_with_active_scale_dtypes(pattern, scale_dtype):
         "strided",
         "cpu_logits",
         "cpu_scale",
-        "foreign_scale",
+        pytest.param(
+            "foreign_scale",
+            marks=pytest.mark.skipif(
+                torch.xpu.device_count() < 2, reason="Two XPUs required"
+            ),
+        ),
     ],
 )
 def test_routing_rejects_unsupported_inputs(case):

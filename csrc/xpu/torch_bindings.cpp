@@ -57,6 +57,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.impl("int4_gemm_w4a8", torch::kXPU, &int4_gemm_w4a8);
 
 #ifdef VLLM_MOE_ENABLED
+  #ifdef VLLM_XPU_ENABLE_XE2
   xpu_ops.def(
       "gemma_moe_topk_interface(Tensor logits, Tensor per_expert_scale, int "
       "topk) -> (Tensor, Tensor)");
@@ -70,6 +71,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "gemma_moe_fused_decode_interface",
       torch::kXPU,
       &gemma_moe_fused_decode_interface);
+  #endif
   xpu_ops.def(
       "cutlass_grouped_gemm_interface(Tensor ptr_A, Tensor? ptr_A_scale, "
       "Tensor ptr_B, Tensor? ptr_B_scale, Tensor? ptr_bias, Tensor ptr_D, "

@@ -7,19 +7,35 @@ remain with the caller. Each plan owns scratch on the weights device; calls
 sharing scratch must be ordered, with separate plans for overlapping streams.
 """
 
+from typing import Optional
+
 import torch
 
 HIDDEN, INTERMEDIATE, EXPERTS, TOP_K, MAX_TOKENS = 2816, 352, 128, 8, 8
 
 
-def is_available() -> bool:
+def is_available(device: Optional[torch.device] = None) -> bool:
     try:
         import vllm_xpu_kernels._xpu_C  # noqa: F401
     except ImportError:
         return False
-    return hasattr(
-        torch.ops._xpu_C, "gemma_moe_fused_decode_interface"
-    ) and hasattr(torch.ops._xpu_C, "gemma_moe_topk_interface")
+    if not torch.xpu.is_available() or (
+        device is not None and device.type != "xpu"
+    ):
+        return False
+    ops = torch.ops._xpu_C
+    if not all(
+        hasattr(ops, name)
+        for name in (
+            "gemma_moe_fused_decode_interface",
+            "gemma_moe_topk_interface",
+            "is_xe2_arch",
+            "is_xe3_arch",
+        )
+    ):
+        return False
+    index = -1 if device is None or device.index is None else device.index
+    return ops.is_xe2_arch(index) or ops.is_xe3_arch(index)
 
 
 def supports(
@@ -30,9 +46,10 @@ def supports(
     intermediate_size: int,
     num_experts: int,
     top_k: int,
+    device: Optional[torch.device] = None,
 ) -> bool:
     return (
-        is_available()
+        is_available(device)
         and dtype in (torch.float16, torch.bfloat16)
         and weight_dtype == torch.float8_e4m3fn
         and 1 <= num_tokens <= MAX_TOKENS
@@ -62,6 +79,10 @@ class XpuGemmaMoEFusedDecode:
         self.device = w13.device
         if self.device.type != "xpu":
             raise ValueError("expert weights must be on XPU")
+        if not is_available(self.device):
+            raise ValueError(
+                "Gemma fused decode requires Xe2/Xe3 kernels on this device"
+            )
         for name, tensor in (
             ("w13", w13),
             ("s13", s13),
