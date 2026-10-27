@@ -692,7 +692,8 @@ if(XPU_SPECIFIC_KERNELS_ENABLED)
       "csrc/xpu/utils.cpp")
   if(MOE_KERNELS_ENABLED)
     list(APPEND VLLM_EXT_XPU_SRC
-         "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp")
+         "csrc/xpu/grouped_gemm/grouped_gemm_interface.cpp"
+         "csrc/xpu/grouped_gemm/gemma_moe_fused_interface.cpp")
   endif()
   if(GDN_KERNELS_ENABLED)
     list(APPEND VLLM_EXT_XPU_SRC "csrc/xpu/gdn_attn/gdn_attn_interface.cpp")
